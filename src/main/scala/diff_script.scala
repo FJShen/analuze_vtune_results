@@ -1,7 +1,9 @@
 import org.apache.spark.sql.{SparkSession, DataFrame, Column}
+import org.apache.spark.sql.functions.udf
 
 import scopt.OParser
 import org.apache.spark.SparkContext
+import org.apache.spark.sql.expressions.UserDefinedFunction
 
 object AnalyzeDiff {
   def main(args: Array[String]) {
@@ -67,10 +69,15 @@ object AnalyzeDiff {
       joined_table_with_nulls.na.fill(0, column_names)
     }
 
-   //rearrange the columns for a better view
-    val rearranged_column_names = outer_joined_table.columns.sorted
-    val rearranged_columns = rearranged_column_names.map(outer_joined_table(_))
-    val rearranged_table = outer_joined_table.select(rearranged_columns:_*)
+    //rearrange the columns for a better view
+    val rearranged_table = {
+      val rearranged_column_names = outer_joined_table.columns.sorted
+      val rearranged_columns =
+        rearranged_column_names.map(outer_joined_table(_))
+      outer_joined_table.select(rearranged_columns: _*) 
+      //The function signature of select is (Columns* => Dataframe). 
+      //What does * in the function signature mean? What does :_* in the function invocation mean? Check this out: https://scala-lang.org/files/archive/spec/2.13/04-basic-declarations-and-definitions.html#repeated-parameters
+    }
 
     //create a reference ${final_table} to the table that we want to save
     val final_table = rearranged_table
