@@ -1,9 +1,11 @@
 import org.apache.spark.sql.{SparkSession, DataFrame, Column}
-import org.apache.spark.sql.functions.udf
+import org.apache.spark.sql.functions._
 
 import scopt.OParser
 import org.apache.spark.SparkContext
 import org.apache.spark.sql.expressions.UserDefinedFunction
+
+import com.twitter.algebird._ //to find moments of dataset
 
 object AnalyzeDiff {
   def main(args: Array[String]) {
@@ -26,7 +28,7 @@ object AnalyzeDiff {
             "enforceSchema" -> "False"
           )
         )
-        .csv(fileBasePath + s"frame$idx.csv")
+        .csv(fileBasePath + s"r027frame$idx.csv")
 
       //rename the columns so that no space character exists; all columns' name except the first column are added the suffix "_x" where x is ${idx}
       val original_columns = original_table.columns
@@ -44,7 +46,10 @@ object AnalyzeDiff {
       val filter_criterion = s"CPU_Time_${idx}>0.05"
       val filtered_table = renamed_table
         .filter(filter_criterion)
-        .select("Function", s"CPU_Time_${idx}", s"Instructions_Retired_${idx}")
+        .select(
+          "Function_(Full)",
+          s"CPU_Time_${idx}"
+        ) //, s"Instructions_Retired_${idx}")
 
       if (show_and_write_csv) {
         filtered_table.show() //Spark typically only shows the first twenty rows
@@ -62,25 +67,59 @@ object AnalyzeDiff {
     //start to join the ${iteration} tables, null values are replaced with 0
     val outer_joined_table = {
       val joined_table_with_nulls = table_list.reduce { (a, b) =>
-        a.join(b, Seq("Function"), "outer")
+        a.join(b, Seq("Function_(Full)"), "outer")
       }
       val column_names = joined_table_with_nulls.columns
 
       joined_table_with_nulls.na.fill(0, column_names)
     }
 
+    //create a ArrayType column (which contains all CPU time) and add to the table
+    //the purpose of doing this is to make per-row calculation easier (e.g. calculate the average CPU_Time of each row)
+
+    val table_with_array = {
+      val cpu_time_column_names = (1 to iteration).map(x => s"CPU_Time_$x")
+      val seq_of_cpu_time_columns: Seq[Column] =
+        outer_joined_table.columns.foldLeft(Seq[Column]()) { (seq, cn) =>
+          cn match {
+            case x if cpu_time_column_names.contains(cn) =>
+              seq :+ outer_joined_table.apply(x)
+            case _ => seq
+          }
+        }
+      outer_joined_table.withColumn(
+        "CPU_Time_Array",
+        array(seq_of_cpu_time_columns: _*)
+      )
+    }
+    table_with_array.createOrReplaceTempView("table_with_array")
+    //table_with_array.show()
+
+    //calculate skewness of each row's CPU Time
+    /*val skewness = udf((seq: Seq[Double]) => {
+      def getMoments(xs: Seq[Double]): Moments =
+        xs.foldLeft(MomentsGroup.zero) { (m, x) =>
+          MomentsGroup.plus(m, Moments(x))
+        }
+      getMoments(seq).skewness
+    })
+
+    spark.udf.register("skewness", skewness)
+    val calculated_table =
+      spark.sql("select *, skewness(CPU_Time_Array) from table_with_array")
+*/
     //rearrange the columns for a better view
     val rearranged_table = {
-      val rearranged_column_names = outer_joined_table.columns.sorted
+      val rearranged_column_names = table_with_array.columns.sorted
       val rearranged_columns =
-        rearranged_column_names.map(outer_joined_table(_))
-      outer_joined_table.select(rearranged_columns: _*) 
-      //The function signature of select is (Columns* => Dataframe). 
+        rearranged_column_names.map(table_with_array(_))
+      table_with_array.select(rearranged_columns: _*)
+      //The function signature of [[select]] is (Columns* => Dataframe).
       //What does * in the function signature mean? What does :_* in the function invocation mean? Check this out: https://scala-lang.org/files/archive/spec/2.13/04-basic-declarations-and-definitions.html#repeated-parameters
     }
 
     //create a reference ${final_table} to the table that we want to save
-    val final_table = rearranged_table
+    val final_table = rearranged_table.drop("CPU_Time_Array")
 
     //write the table to file
     //repartition the table down to one partition so that only one file is generated
@@ -91,7 +130,7 @@ object AnalyzeDiff {
       .write
       .options(Map("sep" -> "|||", "header" -> "True"))
       .mode("overwrite")
-      .csv(fileBasePath + "joined_table.csv")
+      .csv(fileBasePath + "r027joined_table.csv")
 
   }
 }
