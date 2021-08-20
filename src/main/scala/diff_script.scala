@@ -1,14 +1,21 @@
 import org.apache.spark.sql.{SparkSession, DataFrame, Column}
 import org.apache.spark.sql.functions._
 
-import scopt.OParser
 import org.apache.spark.SparkContext
 import org.apache.spark.sql.expressions.UserDefinedFunction
 
 import org.apache.commons.math3.stat.descriptive.moment._ //Skewness, Mean
 
+import org.rogach.scallop.ScallopConf //CLI argument parsing
+
 object AnalyzeDiff {
   def main(args: Array[String]) {
+    val conf = new Conf(args)
+    print("\nfileBasePath is " + conf.fileBasePath())
+    print("\nlogLevel is " + conf.logLevel())
+    print("\ndryRun is " + conf.dryRun())
+
+    return
     val sc = new SparkContext
     sc.setLogLevel("WARN")
 
@@ -16,7 +23,6 @@ object AnalyzeDiff {
     val fileBasePath = "/home/shen449/intel/vtune/projects/pc01-rapids/"
     val iteration = 5
     val show_and_write_csv = false
-
     val table_list: Seq[DataFrame] = (1 to iteration).toList.map { idx =>
       //read the raw output file from vtune
       val original_table = spark.read
@@ -32,8 +38,8 @@ object AnalyzeDiff {
 
       //rename the columns so that no space character exists; all columns' name except the first column are added the suffix "_x" where x is ${idx}
       val original_columns = original_table.columns
-      val renamed_columns = original_columns.map{ str => 
-        str match{
+      val renamed_columns = original_columns.map { str =>
+        str match {
           case x if str.contains("Function") => x.replace(" ", "_")
           case _ => (str + s"_$idx").replace(" ", "_")
         }
@@ -106,7 +112,7 @@ object AnalyzeDiff {
       sk.evaluate(x.toArray, 0, x.length)
     })
 
-    val avrg = udf((x:Seq[Double]) => {
+    val avrg = udf((x: Seq[Double]) => {
       val mn = new Mean()
       mn.evaluate(x.toArray, 0, x.length)
     })
@@ -115,8 +121,9 @@ object AnalyzeDiff {
     spark.udf.register("avrg", avrg)
 
     val calculated_table =
-      spark.sql("select *, skewness(CPU_Time_Array) AS Skewness, avrg(CPU_Time_Array) AS Average from table_with_array")
-    
+      spark.sql(
+        "select *, skewness(CPU_Time_Array) AS Skewness, avrg(CPU_Time_Array) AS Average from table_with_array"
+      )
 
     //rearrange the columns for a better view
     val rearranged_table = {
@@ -143,4 +150,40 @@ object AnalyzeDiff {
       .csv(fileBasePath + "r027joined_table.csv")
 
   }
+
+}
+
+class Conf(arguments: Seq[String]) extends ScallopConf(arguments) {
+  val fileBasePath = opt[String](
+    short = 'f',
+    required = false,
+    default = Option("."),
+    descr =
+      """Where the home directory for vTune csv-format report files is located. This direcotry is required to have a hierarchy looking like this: 
+                |fileBasePath
+                |       ├─q1
+                |       │  ├─it1
+                |       │  ├─it2
+                |       │  └─it3
+                |       ├─q2
+                |       │  ├─it1
+                |       │  ├─it2
+                |       │  └─it3
+                |       └...""".stripMargin
+  )
+  val logLevel = opt[String](
+    short = 'l',
+    required = false,
+    default = Option("WARN"),
+    descr =
+      "Control Spark's log level. Valid log levels include : ALL, DEBUG, ERROR, FATAL, INFO, OFF, TRACE, WARN",
+    validate =
+      (Seq("ALL", "DEBUG", "ERROR", "FATAL", "INFO", "OFF", "TRACE", "WARN")
+        .contains(_))
+  )
+  val dryRun = opt[Boolean](
+    short = 'n'
+  )
+
+  verify()
 }
