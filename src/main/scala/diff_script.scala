@@ -5,7 +5,7 @@ import scopt.OParser
 import org.apache.spark.SparkContext
 import org.apache.spark.sql.expressions.UserDefinedFunction
 
-import com.twitter.algebird._ //to find moments of dataset
+import org.apache.commons.math3.stat.descriptive.moment._ //Skewness, Mean
 
 object AnalyzeDiff {
   def main(args: Array[String]) {
@@ -32,8 +32,11 @@ object AnalyzeDiff {
 
       //rename the columns so that no space character exists; all columns' name except the first column are added the suffix "_x" where x is ${idx}
       val original_columns = original_table.columns
-      val renamed_columns = original_columns.head +: original_columns.tail.map {
-        str => (str + s"_$idx").replace(" ", "_")
+      val renamed_columns = original_columns.map{ str => 
+        str match{
+          case x if str.contains("Function") => x.replace(" ", "_")
+          case _ => (str + s"_$idx").replace(" ", "_")
+        }
       }
       val renamed_table =
         (original_columns zip renamed_columns).foldLeft(original_table) {
@@ -74,20 +77,22 @@ object AnalyzeDiff {
       joined_table_with_nulls.na.fill(0, column_names)
     }
 
+    val groupped_table = outer_joined_table.groupBy("Function_(Full)").sum()
+
     //create a ArrayType column (which contains all CPU time) and add to the table
     //the purpose of doing this is to make per-row calculation easier (e.g. calculate the average CPU_Time of each row)
 
     val table_with_array = {
-      val cpu_time_column_names = (1 to iteration).map(x => s"CPU_Time_$x")
+      val cpu_time_column_names = (1 to iteration).map(x => s"sum(CPU_Time_$x)")
       val seq_of_cpu_time_columns: Seq[Column] =
-        outer_joined_table.columns.foldLeft(Seq[Column]()) { (seq, cn) =>
+        groupped_table.columns.foldLeft(Seq[Column]()) { (seq, cn) =>
           cn match {
             case x if cpu_time_column_names.contains(cn) =>
-              seq :+ outer_joined_table.apply(x)
+              seq :+ groupped_table.apply(x)
             case _ => seq
           }
         }
-      outer_joined_table.withColumn(
+      groupped_table.withColumn(
         "CPU_Time_Array",
         array(seq_of_cpu_time_columns: _*)
       )
@@ -96,24 +101,29 @@ object AnalyzeDiff {
     //table_with_array.show()
 
     //calculate skewness of each row's CPU Time
-    /*val skewness = udf((seq: Seq[Double]) => {
-      def getMoments(xs: Seq[Double]): Moments =
-        xs.foldLeft(MomentsGroup.zero) { (m, x) =>
-          MomentsGroup.plus(m, Moments(x))
-        }
-      getMoments(seq).skewness
+    val skewness = udf((x: Seq[Double]) => {
+      val sk = new Skewness()
+      sk.evaluate(x.toArray, 0, x.length)
+    })
+
+    val avrg = udf((x:Seq[Double]) => {
+      val mn = new Mean()
+      mn.evaluate(x.toArray, 0, x.length)
     })
 
     spark.udf.register("skewness", skewness)
+    spark.udf.register("avrg", avrg)
+
     val calculated_table =
-      spark.sql("select *, skewness(CPU_Time_Array) from table_with_array")
-*/
+      spark.sql("select *, skewness(CPU_Time_Array) AS Skewness, avrg(CPU_Time_Array) AS Average from table_with_array")
+    
+
     //rearrange the columns for a better view
     val rearranged_table = {
-      val rearranged_column_names = table_with_array.columns.sorted
+      val rearranged_column_names = calculated_table.columns.sorted
       val rearranged_columns =
-        rearranged_column_names.map(table_with_array(_))
-      table_with_array.select(rearranged_columns: _*)
+        rearranged_column_names.map(calculated_table(_))
+      calculated_table.select(rearranged_columns: _*)
       //The function signature of [[select]] is (Columns* => Dataframe).
       //What does * in the function signature mean? What does :_* in the function invocation mean? Check this out: https://scala-lang.org/files/archive/spec/2.13/04-basic-declarations-and-definitions.html#repeated-parameters
     }
