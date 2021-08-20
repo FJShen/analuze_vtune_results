@@ -6,21 +6,22 @@ import org.apache.spark.sql.expressions.UserDefinedFunction
 
 import org.apache.commons.math3.stat.descriptive.moment._ //Skewness, Mean
 
-import org.rogach.scallop.ScallopConf //CLI argument parsing
+import org.rogach.scallop._ //CLI argument parsing
 
 object AnalyzeDiff {
   def main(args: Array[String]) {
+    //parse CLI arguments
     val conf = new Conf(args)
-    print("\nfileBasePath is " + conf.fileBasePath())
-    print("\nlogLevel is " + conf.logLevel())
-    print("\ndryRun is " + conf.dryRun())
 
-    return
     val sc = new SparkContext
-    sc.setLogLevel("WARN")
+    sc.setLogLevel(conf.logLevel())
 
     val spark = SparkSession.builder.appName("AnalyzeDifference").getOrCreate
-    val fileBasePath = "/home/shen449/intel/vtune/projects/pc01-rapids/"
+    val fileBasePath = conf.fileBasePath() //"/home/shen449/intel/vtune/projects/pc01-rapids/"
+
+    //TODO: scan the directory to obtain a list of queries to process
+    //TODO: for each query, figure out how many (=$iteration) files require processing
+
     val iteration = 5
     val show_and_write_csv = false
     val table_list: Seq[DataFrame] = (1 to iteration).toList.map { idx =>
@@ -157,7 +158,7 @@ class Conf(arguments: Seq[String]) extends ScallopConf(arguments) {
   val fileBasePath = opt[String](
     short = 'f',
     required = false,
-    default = Option("."),
+    default = Option("/home/shen449/intel/vtune/projects/pc01-rapids/"),
     descr =
       """Where the home directory for vTune csv-format report files is located. This direcotry is required to have a hierarchy looking like this: 
                 |fileBasePath
