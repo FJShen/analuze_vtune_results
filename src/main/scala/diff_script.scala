@@ -8,6 +8,9 @@ import org.apache.commons.math3.stat.descriptive.moment._ //Skewness, Mean
 
 import org.rogach.scallop._ //CLI argument parsing
 
+import org.apache.commons.io._
+import java.io.File
+
 object AnalyzeDiff {
   def main(args: Array[String]) {
     //parse CLI arguments
@@ -17,9 +20,18 @@ object AnalyzeDiff {
     sc.setLogLevel(conf.logLevel())
 
     val spark = SparkSession.builder.appName("AnalyzeDifference").getOrCreate
-    val fileBasePath = conf.fileBasePath() //"/home/shen449/intel/vtune/projects/pc01-rapids/"
+    val fileBasePath = conf.fileBasePath() 
+
 
     //TODO: scan the directory to obtain a list of queries to process
+    val dir = new File(fileBasePath)
+    val dir_content_list = FileUtils.listFiles(dir, Array[String](), false).toArray(Array[File]())
+    print("get dir_content_list from "+dir.getPath() +s", length is ${dir_content_list.length}\n")
+    for (x <- dir_content_list){
+      print(x.getPath() + "\n")
+    }
+    return
+
     //TODO: for each query, figure out how many (=$iteration) files require processing
 
     val iteration = 5
