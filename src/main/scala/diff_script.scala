@@ -166,14 +166,15 @@ object AnalyzeDiff {
     }
 
     //aggregate the rows by function name
-    val groupped_table = outer_joined_table.groupBy("Function_(Full)").sum()
+    //this table is defined as a VAR because it will be clobbered when we add the array-type columns to it 
+    var groupped_table = outer_joined_table.groupBy("Function_(Full)").sum()
 
     //create a ArrayType column (which contains all CPU time) and add to the table
     //the purpose of doing this is to make per-row calculation easier (e.g. calculate the average CPU_Time of each row)
     //Each column - let denote it 'x' - that we name in ${columns_of_interest} needs to be created an array that aggregates 
     //col(x_1), col(x_2), ..., col(x_n) where n is equal to ${iteration}
 
-    val table_with_array = {
+    /*val table_with_array = {
       val cpu_time_column_names = (1 to iteration).map(x => s"sum(CPU_Time_$x)")
       val seq_of_cpu_time_columns: Seq[Column] =
         groupped_table.columns.foldLeft(Seq[Column]()) { (seq, cn) =>
@@ -187,25 +188,61 @@ object AnalyzeDiff {
         "CPU_Time_Array",
         array(seq_of_cpu_time_columns: _*)
       )
-    }
+    }*/
 
     val table_with_array_2 = {
       columns_of_interest.foreach{ 
-        case x if x.contains("Function") => {
-          //do nothing
+        case coi if (coi.contains("Function") == false) => {
+          val per_iteration_column_names = (1 to iteration).map(idx => "sum(" + coi + s"_${idx})")
+          val seq_of_columns : Seq[Column] = 
+          groupped_table.columns.foldLeft(Seq[Column]()) { (seq, cn) =>
+            cn match {
+              case cn if per_iteration_column_names.contains(cn) =>
+                seq :+ groupped_table.apply(cn)
+              case _ => seq
+            }
+          }
+          groupped_table = groupped_table.withColumn(coi + "_Array", array(seq_of_columns:_*))
         }
-        case _ => {
-          //do nothing
-        }
+        case _ => {}
       }
+      groupped_table
     }
 
-    table_with_array.createOrReplaceTempView("table_with_array")
-    //table_with_array.show()
+    table_with_array_2.createOrReplaceTempView("table_with_array")
+    //table_with_array_2.show()
+    //table_with_array_2.printSchema()
+
+
+    var sql_query_plan = Array[String]()
+    columns_of_interest.foreach{
+      case coi if(coi.contains("Function") == false) =>{
+        val array_name = coi + "_Array"
+
+        sql_query_plan = sql_query_plan :+ ","
+        sql_query_plan = sql_query_plan :+ ("skewness(`" + array_name + "`) AS `Skewness_of_" + coi + "`" )
+
+        sql_query_plan = sql_query_plan :+ ","
+        sql_query_plan = sql_query_plan :+ ("avrg(`" + array_name + "`) AS `Average_of_" + coi +"`")
+      }
+      case _ => {}
+    }
+    //the sql query plan should now look like this: ", xxx, yyy, zzz, www, ..., aaa, bbb"
+    //remove the first comma from the query plan
+    sql_query_plan = sql_query_plan.tail
+
+    //add the constant part to the query plan
+    sql_query_plan = "select *," +: sql_query_plan
+    sql_query_plan = sql_query_plan :+ "from table_with_array"
+    
+    val sql_query_plan_text = sql_query_plan.mkString(" ")
+    print(sql_query_plan_text+"\n")
 
     val calculated_table =
       spark.sql(
-        "select *, skewness(CPU_Time_Array) AS Skewness, avrg(CPU_Time_Array) AS Average from table_with_array"
+        //"select *, skewness(CPU_Time_Array) AS Skewness_of_CPU_Time , avrg(CPU_Time_Array) AS Average_of_CPU_Time , skewness(CPU_Time:Effective_Time:Idle_Array) AS Skewness_of_CPU_Time:Effective_Time:Idle , avrg(CPU_Time:Effective_Time:Idle_Array) AS Average_of_CPU_Time:Effective_Time:Idle , skewness(CPU_Time:Effective_Time:Poor_Array) AS Skewness_of_CPU_Time:Effective_Time:Poor , avrg(CPU_Time:Effective_Time:Poor_Array) AS Average_of_CPU_Time:Effective_Time:Poor , skewness(CPU_Time:Effective_Time:Ok_Array) AS Skewness_of_CPU_Time:Effective_Time:Ok , avrg(CPU_Time:Effective_Time:Ok_Array) AS Average_of_CPU_Time:Effective_Time:Ok , skewness(CPU_Time:Effective_Time:Ideal_Array) AS Skewness_of_CPU_Time:Effective_Time:Ideal , avrg(CPU_Time:Effective_Time:Ideal_Array) AS Average_of_CPU_Time:Effective_Time:Ideal , skewness(CPU_Time:Effective_Time:Over_Array) AS Skewness_of_CPU_Time:Effective_Time:Over , avrg(CPU_Time:Effective_Time:Over_Array) AS Average_of_CPU_Time:Effective_Time:Over from table_with_array"
+        //"select *, skewness(CPU_Time_Array) AS Skewness , avrg(CPU_Time_Array) AS Average from table_with_array"
+        sql_query_plan_text
       )
 
     //rearrange the columns for a better view
@@ -219,14 +256,20 @@ object AnalyzeDiff {
     }
 
     //create a reference ${final_table} to the table that we want to save
-    val final_table = rearranged_table.drop("CPU_Time_Array")
+    //val final_table = rearranged_table.drop("CPU_Time_Array")
+    val final_table = rearranged_table.columns.foldLeft(rearranged_table){(tbl, column_name) => 
+      column_name match {
+        case cn if column_name.contains("Array") => tbl.drop(cn)
+        case _ => tbl
+      }
+    }
 
     //write the table to file
     //repartition the table down to one partition so that only one file is generated
     val result_file = new File(query_path, "result.csv")
 
-    print(final_table.schema + "\n")
-    final_table.show
+    final_table.printSchema()
+    //final_table.show
     final_table
       .repartition(1)
       .write
