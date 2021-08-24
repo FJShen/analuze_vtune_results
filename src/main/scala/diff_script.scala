@@ -87,7 +87,6 @@ object AnalyzeDiff {
   def createTable(spark: SparkSession, query_path: File, iteration: Int) {
 
     val show_and_write_csv = true
-    val filter_criterion = s"CPU_Time_${idx}>0.05"
     val columns_of_interest: Seq[String] = Seq(
       "Function_(Full)",
       "CPU_Time",
@@ -97,7 +96,6 @@ object AnalyzeDiff {
       "CPU_Time:Effective_Time:Ideal",
       "CPU_Time:Effective_Time:Over"
     )
-    val renamed_columns_of_interest = columns_of_interest.map(rename_column_function(idx))
 
     //the renaming function replaces all spaces with equal amount of underscores, 
     //and adds a numerical suffix to the string if the string does not contain substring "Function"
@@ -134,7 +132,9 @@ object AnalyzeDiff {
         }
 
       //only take record of function calls that exceed 0.05 CPU seconds
-      //project the renamed table on only the columns we are interested      
+      //project the renamed table on only the columns we are interested
+      val filter_criterion = s"CPU_Time_${idx}>0.05"      
+      val renamed_columns_of_interest = columns_of_interest.map(rename_column_function(idx))
       val dummy_column = renamed_table("Function").as("Dummy")
       val filtered_table = renamed_table
         .withColumn("Dummy", dummy_column)
@@ -190,7 +190,14 @@ object AnalyzeDiff {
     }
 
     val table_with_array_2 = {
-      
+      columns_of_interest.foreach{ 
+        case x if x.contains("Function") => {
+          //do nothing
+        }
+        case _ => {
+          //do nothing
+        }
+      }
     }
 
     table_with_array.createOrReplaceTempView("table_with_array")
