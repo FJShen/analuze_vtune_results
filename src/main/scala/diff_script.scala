@@ -9,7 +9,8 @@ import org.apache.commons.math3.stat.descriptive.moment._ //Skewness, Mean
 import org.rogach.scallop._ //CLI argument parsing
 
 import org.apache.commons.io._
-import java.io.File
+import java.io.{File, FileFilter}
+import java.lang.Exception
 
 object AnalyzeDiff {
   def main(args: Array[String]) {
@@ -20,24 +21,96 @@ object AnalyzeDiff {
     sc.setLogLevel(conf.logLevel())
 
     val spark = SparkSession.builder.appName("AnalyzeDifference").getOrCreate
-    val fileBasePath = conf.fileBasePath() 
 
+    spark.udf.register("skewness", skewness)
+    spark.udf.register("avrg", avrg)
 
-    //TODO: scan the directory to obtain a list of queries to process
-    val dir = new File(fileBasePath)
-    val dir_content_list = FileUtils.listFiles(dir, Array[String](), false).toArray(Array[File]())
-    print("get dir_content_list from "+dir.getPath() +s", length is ${dir_content_list.length}\n")
-    for (x <- dir_content_list){
+    //scan the directory to obtain a list of queries to process
+    val reportLocation = conf.reportLocation()
+    val dir = new File(reportLocation)
+    val dir_content_list = dir.listFiles()
+    print(
+      "get dir_content_list from " + dir
+        .getPath() + s", length is ${dir_content_list.length}\n"
+    )
+    dir_content_list.foreach { x =>
       print(x.getPath() + "\n")
     }
+
+    dir_content_list.foreach { query_path =>
+      analyzeQueryResult(spark, query_path)
+    }
     return
+  }
 
-    //TODO: for each query, figure out how many (=$iteration) files require processing
+  def analyzeQueryResult(spark: SparkSession, query_path: File) {
+    print(s"query path name is ${query_path.getName()}\n")
 
-    val iteration = 5
-    val show_and_write_csv = false
+    lazy val dir_only_filter = new FileFilter(){
+      override def accept(file: File): Boolean = {
+        //ignore all directories in this folder
+        !(file.isDirectory())
+      }
+    }
+
+    val query_dir_content_list = query_path.listFiles(dir_only_filter)
+    query_dir_content_list.foreach(x=>
+      print(s"file name is ${x.getName()}\n")
+    )
+
+    if (query_dir_content_list.length == 0) {
+      print(s"${query_path.getPath()} is void of files. Skipping this.\n")
+    } else {
+      //extract the number of iteration and find the maximum value
+      val name_list = query_dir_content_list.map(_.getName())
+      val csv_name_pattern = """it(\d+)\.csv""".r
+      val stripped_name_list = name_list.map { x =>
+        x match {
+          case csv_name_pattern(value) => {
+            print(s"value is $value\n")
+            value
+          }
+          case _ => {
+            throw new Exception(s"${x}: file format wrong")
+          }
+        }
+      }
+
+      val iteration: Int = stripped_name_list.max.toInt
+      print(s"iteration is $iteration\n")
+
+      if(query_path.getName()=="q1")
+        createTable(spark, query_path, iteration)
+    }
+  }
+
+  def createTable(spark: SparkSession, query_path: File, iteration: Int) {
+
+    val show_and_write_csv = true
+    val columns_of_interest: Seq[String] = Seq(
+      "Function_(Full)",
+      "CPU_Time",
+      "CPU_Time:Effective_Time:Idle",
+      "CPU_Time:Effective_Time:Poor",
+      "CPU_Time:Effective_Time:Ok",
+      "CPU_Time:Effective_Time:Ideal",
+      "CPU_Time:Effective_Time:Over"
+    )
+
+    //the renaming function replaces all spaces with equal amount of underscores, 
+    //and adds a numerical suffix to the string if the string does not contain substring "Function"
+    def rename_column_function(idx: Int)(str: String) = {
+      str match {
+        case x if str.contains("Function") => x.replace(" ", "_")
+        case _                             => (str + s"_$idx").replace(" ", "_")
+      }
+    }
+
     val table_list: Seq[DataFrame] = (1 to iteration).toList.map { idx =>
-      //read the raw output file from vtune
+      //read the raw output file from vtune report
+      val csv_file = new File(query_path, s"it${idx}.csv")
+      //print(s"csv_file path is ${csv_file.getPath()}\n")
+
       val original_table = spark.read
         .options(
           Map(
@@ -47,16 +120,11 @@ object AnalyzeDiff {
             "enforceSchema" -> "False"
           )
         )
-        .csv(fileBasePath + s"r027frame$idx.csv")
+        .csv(csv_file.getPath())
 
       //rename the columns so that no space character exists; all columns' name except the first column are added the suffix "_x" where x is ${idx}
       val original_columns = original_table.columns
-      val renamed_columns = original_columns.map { str =>
-        str match {
-          case x if str.contains("Function") => x.replace(" ", "_")
-          case _ => (str + s"_$idx").replace(" ", "_")
-        }
-      }
+      val renamed_columns = original_columns.map(rename_column_function(idx))
       val renamed_table =
         (original_columns zip renamed_columns).foldLeft(original_table) {
           (tbl, pair) =>
@@ -64,22 +132,25 @@ object AnalyzeDiff {
         }
 
       //only take record of function calls that exceed 0.05 CPU seconds
-      //project the renamed table on CPU Time and # of Insns Retired
+      //project the renamed table on only the columns we are interested
+      //todo: columns of interest should be declared out of this map statement
+      
+      val renamed_columns_of_interest = columns_of_interest.map(rename_column_function(idx))
       val filter_criterion = s"CPU_Time_${idx}>0.05"
+      val dummy_column = renamed_table("Function").as("Dummy")
       val filtered_table = renamed_table
+        .withColumn("Dummy", dummy_column)
         .filter(filter_criterion)
-        .select(
-          "Function_(Full)",
-          s"CPU_Time_${idx}"
-        ) //, s"Instructions_Retired_${idx}")
+        .select("Dummy", renamed_columns_of_interest:_*)
+        .drop("Dummy")
 
       if (show_and_write_csv) {
         filtered_table.show() //Spark typically only shows the first twenty rows
         print(filtered_table.schema + "\n")
-        filtered_table.write
+        /*filtered_table.write
           .options(Map("sep" -> "|||", "header" -> "True"))
           .mode("overwrite")
-          .csv(fileBasePath + s"frame${idx}_renamed.csv")
+          .csv(reportLocation + s"frame${idx}_renamed.csv")*/
       }
 
       //return value of "map"
@@ -96,10 +167,13 @@ object AnalyzeDiff {
       joined_table_with_nulls.na.fill(0, column_names)
     }
 
+    //aggregate the rows by function name
     val groupped_table = outer_joined_table.groupBy("Function_(Full)").sum()
 
     //create a ArrayType column (which contains all CPU time) and add to the table
     //the purpose of doing this is to make per-row calculation easier (e.g. calculate the average CPU_Time of each row)
+    //Each column - let denote it 'x' - that we name in ${columns_of_interest} needs to be created an array that aggregates 
+    //col(x_1), col(x_2), ..., col(x_n) where n is equal to ${iteration}
 
     val table_with_array = {
       val cpu_time_column_names = (1 to iteration).map(x => s"sum(CPU_Time_$x)")
@@ -118,20 +192,6 @@ object AnalyzeDiff {
     }
     table_with_array.createOrReplaceTempView("table_with_array")
     //table_with_array.show()
-
-    //calculate skewness of each row's CPU Time
-    val skewness = udf((x: Seq[Double]) => {
-      val sk = new Skewness()
-      sk.evaluate(x.toArray, 0, x.length)
-    })
-
-    val avrg = udf((x: Seq[Double]) => {
-      val mn = new Mean()
-      mn.evaluate(x.toArray, 0, x.length)
-    })
-
-    spark.udf.register("skewness", skewness)
-    spark.udf.register("avrg", avrg)
 
     val calculated_table =
       spark.sql(
@@ -153,6 +213,8 @@ object AnalyzeDiff {
 
     //write the table to file
     //repartition the table down to one partition so that only one file is generated
+    val result_file = new File(query_path, "result.csv")
+
     print(final_table.schema + "\n")
     final_table.show
     final_table
@@ -160,20 +222,30 @@ object AnalyzeDiff {
       .write
       .options(Map("sep" -> "|||", "header" -> "True"))
       .mode("overwrite")
-      .csv(fileBasePath + "r027joined_table.csv")
-
+      .csv(result_file.getPath())
   }
+
+  val skewness = udf((x: Seq[Double]) => {
+    val sk = new Skewness()
+    sk.evaluate(x.toArray, 0, x.length)
+  })
+
+  val avrg = udf((x: Seq[Double]) => {
+    val mn = new Mean()
+    mn.evaluate(x.toArray, 0, x.length)
+  })
+
 
 }
 
 class Conf(arguments: Seq[String]) extends ScallopConf(arguments) {
-  val fileBasePath = opt[String](
-    short = 'f',
-    required = false,
-    default = Option("/home/shen449/intel/vtune/projects/pc01-rapids/"),
+  val reportLocation = opt[String](
+    short = 'r',
+    required = true,
+    //default = Option("/home/shen449/analyze_vtune_results/extracted_reports/"),
     descr =
       """Where the home directory for vTune csv-format report files is located. This direcotry is required to have a hierarchy looking like this: 
-                |fileBasePath
+                |reportLocation
                 |       ├─q1
                 |       │  ├─it1
                 |       │  ├─it2
