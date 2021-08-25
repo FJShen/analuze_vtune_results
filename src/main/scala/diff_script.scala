@@ -118,6 +118,17 @@ object AnalyzeDiff {
       "CPU_Time:Effective_Time:Over"
     )
 
+    val can_calculate_weighted_wall_time =
+      columns_of_interest.contains("CPU_Time:Effective_Time:Poor") &&
+        columns_of_interest.contains("CPU_Time:Effective_Time:Ok") &&
+        columns_of_interest.contains("CPU_Time:Effective_Time:Ideal") &&
+        columns_of_interest.contains("CPU_Time:Effective_Time:Over")
+
+    val columns_eligible_to_create_an_array_for =
+      if (can_calculate_weighted_wall_time)
+        columns_of_interest :+ "Wall_Time_Approx"
+      else columns_of_interest
+
     //the renaming function replaces all spaces with equal amount of underscores,
     //and adds a numerical suffix to the string if the string does not contain substring "Function"
     def rename_column_function(idx: Int)(str: String) = {
@@ -177,9 +188,46 @@ object AnalyzeDiff {
           }
       }
 
+      //calculate a weighted average of the CPU effective time and call it the "wall time"
+      //this is a wild approximation
+      val denominator = 40
+      val weights = Map[String, Double](
+        "Poor" -> 2,
+        "Ok" -> 6,
+        "Ideal" -> 10,
+        "Over" -> 20
+      )
+
+      val final_per_iteration_table = {
+        if (can_calculate_weighted_wall_time) {
+          val weighted_column =
+            agg_table_renamed(s"CPU_Time:Effective_Time:Poor_${idx}") / weights(
+              "Poor"
+            ) +
+              agg_table_renamed(s"CPU_Time:Effective_Time:Ok_${idx}") / weights(
+                "Ok"
+              ) +
+              agg_table_renamed(
+                s"CPU_Time:Effective_Time:Ideal_${idx}"
+              ) / weights(
+                "Ideal"
+              ) +
+              agg_table_renamed(
+                s"CPU_Time:Effective_Time:Over_${idx}"
+              ) / weights(
+                "Over"
+              )
+          agg_table_renamed.withColumn(
+            s"Wall_Time_Approx_${idx}",
+            weighted_column
+          )
+        } else agg_table_renamed
+      }
+
       if (show_csv) {
-        agg_table_renamed.show() //Spark typically only shows the first twenty rows
-        print(agg_table_renamed.schema + "\n")
+        final_per_iteration_table
+          .show() //Spark typically only shows the first twenty rows
+        print(final_per_iteration_table.schema + "\n")
         /*filtered_table.write
           .options(Map("sep" -> "|||", "header" -> "True"))
           .mode("overwrite")
@@ -187,7 +235,7 @@ object AnalyzeDiff {
       }
 
       //return value of "map"
-      agg_table_renamed
+      final_per_iteration_table
     }
 
     //start to join the ${iteration} tables, null values are replaced with 0
@@ -207,11 +255,11 @@ object AnalyzeDiff {
     //col(x_1), col(x_2), ..., col(x_n) where n is equal to ${iteration}
 
     val table_with_array = {
-      columns_of_interest.foreach {
+      columns_eligible_to_create_an_array_for.foreach {
         case coi if (coi.contains("Function") == false) => {
           //${per_iteration_column_names} will look like Seq("A_1", "A_2", "A_3", ...)
           val per_iteration_column_names =
-            (1 to iteration).map(idx =>  coi + s"_${idx}")
+            (1 to iteration).map(idx => coi + s"_${idx}")
           val seq_of_columns: Seq[Column] =
             outer_joined_table.columns.foldLeft(Seq[Column]()) { (seq, cn) =>
               cn match {
@@ -236,7 +284,7 @@ object AnalyzeDiff {
 
     //generate the query plan to calculate UDFs (skewness, and average)
     var sql_query_plan = Array[String]()
-    columns_of_interest.foreach {
+    columns_eligible_to_create_an_array_for.foreach {
       case coi if (coi.contains("Function") == false) => {
         val array_name = coi + "_Array"
 
@@ -297,7 +345,7 @@ object AnalyzeDiff {
         .options(Map("sep" -> "|||", "header" -> "True"))
         .mode("overwrite")
         .csv(result_file.getPath())
-      print(s"${query_path.getName()} is written to file")
+      print(s"${query_path.getName()} is written to file\n")
     } else {
       final_table.printSchema()
       final_table.show()
@@ -332,7 +380,8 @@ class Conf(arguments: Seq[String]) extends ScallopConf(arguments) {
                 |       │  ├─it1
                 |       │  ├─it2
                 |       │  └─it3
-                |       └...""".stripMargin
+                |       └...""".stripMargin,
+    argName = "reportLocation"
   )
   val logLevel = opt[String](
     short = 'l',
