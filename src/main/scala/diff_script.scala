@@ -37,16 +37,40 @@ object AnalyzeDiff {
       print(x.getPath() + "\n")
     }
 
+    val il = conf.include_list()
+    val queries_to_process: Array[String] = {
+      if (il.length > 0) {
+        il.toArray
+      } else {
+        dir_content_list.map(_.getName())
+      }
+    }
+    print("Quries to process: ")
+    queries_to_process.foreach(x => print(s"$x "))
+    print("\n")
+
     dir_content_list.foreach { query_path =>
-      analyzeQueryResult(spark, query_path)
+      analyzeQueryResult(
+        spark,
+        query_path,
+        queries_to_process,
+        !(conf.dryRun())
+      )
     }
     return
   }
 
-  def analyzeQueryResult(spark: SparkSession, query_path: File) {
-    print(s"query path name is ${query_path.getName()}\n")
+  def analyzeQueryResult(
+      spark: SparkSession,
+      query_path: File,
+      queries_to_process: Array[String],
+      save_result: Boolean = true
+  ) {
+    if (!queries_to_process.contains(query_path.getName())) return
 
-    lazy val dir_only_filter = new FileFilter(){
+    print(s"Analyzing query report for ${query_path.getName()}\n")
+
+    val dir_only_filter = new FileFilter() {
       override def accept(file: File): Boolean = {
         //ignore all directories in this folder
         !(file.isDirectory())
@@ -54,9 +78,6 @@ object AnalyzeDiff {
     }
 
     val query_dir_content_list = query_path.listFiles(dir_only_filter)
-    query_dir_content_list.foreach(x=>
-      print(s"file name is ${x.getName()}\n")
-    )
 
     if (query_dir_content_list.length == 0) {
       print(s"${query_path.getPath()} is void of files. Skipping this.\n")
@@ -64,31 +85,31 @@ object AnalyzeDiff {
       //extract the number of iteration and find the maximum value
       val name_list = query_dir_content_list.map(_.getName())
       val csv_name_pattern = """it(\d+)\.csv""".r
-      val stripped_name_list = name_list.map { x =>
-        x match {
-          case csv_name_pattern(value) => {
-            print(s"value is $value\n")
-            value
-          }
-          case _ => {
-            throw new Exception(s"${x}: file format wrong")
-          }
+      val stripped_name_list = name_list.map {
+        case csv_name_pattern(value) => {
+          value
+        }
+        case x: String => {
+          throw new Exception(s"${x}: file name's format is wrong")
         }
       }
 
       val iteration: Int = stripped_name_list.max.toInt
-      print(s"iteration is $iteration\n")
 
-      if(query_path.getName()=="q1")
-        createTable(spark, query_path, iteration)
+      createTable(spark, query_path, iteration, save_result)
     }
   }
 
-  def createTable(spark: SparkSession, query_path: File, iteration: Int) {
+  def createTable(
+      spark: SparkSession,
+      query_path: File,
+      iteration: Int,
+      save_result: Boolean = true
+  ) {
 
-    val show_and_write_csv = true
+    val show_csv = true
     val columns_of_interest: Seq[String] = Seq(
-      "Function_(Full)",
+      "Function_(Full)", //this one is a must
       "CPU_Time",
       "CPU_Time:Effective_Time:Idle",
       "CPU_Time:Effective_Time:Poor",
@@ -97,7 +118,7 @@ object AnalyzeDiff {
       "CPU_Time:Effective_Time:Over"
     )
 
-    //the renaming function replaces all spaces with equal amount of underscores, 
+    //the renaming function replaces all spaces with equal amount of underscores,
     //and adds a numerical suffix to the string if the string does not contain substring "Function"
     def rename_column_function(idx: Int)(str: String) = {
       str match {
@@ -109,7 +130,6 @@ object AnalyzeDiff {
     val table_list: Seq[DataFrame] = (1 to iteration).toList.map { idx =>
       //read the raw output file from vtune report
       val csv_file = new File(query_path, s"it${idx}.csv")
-      //print(s"csv_file path is ${csv_file.getPath()}\n")
 
       val original_table = spark.read
         .options(
@@ -132,19 +152,34 @@ object AnalyzeDiff {
         }
 
       //only take record of function calls that exceed 0.05 CPU seconds
-      //project the renamed table on only the columns we are interested
-      val filter_criterion = s"CPU_Time_${idx}>0.05"      
-      val renamed_columns_of_interest = columns_of_interest.map(rename_column_function(idx))
+      //project the renamed table on only the columns we are interested in
+      val filter_criterion = s"CPU_Time_${idx}>0.05"
+      val renamed_columns_of_interest =
+        columns_of_interest.map(rename_column_function(idx))
       val dummy_column = renamed_table("Function").as("Dummy")
       val filtered_table = renamed_table
         .withColumn("Dummy", dummy_column)
         .filter(filter_criterion)
-        .select("Dummy", renamed_columns_of_interest:_*)
+        .select("Dummy", renamed_columns_of_interest: _*)
         .drop("Dummy")
 
-      if (show_and_write_csv) {
-        filtered_table.show() //Spark typically only shows the first twenty rows
-        print(filtered_table.schema + "\n")
+      //aggregate the table
+      val agg_table = filtered_table.groupBy("Function_(Full)").sum()
+
+      //rename the columns where a "sum" has been put before the metric name
+      val sum_name_pattern = """sum\((.*)\)""".r
+      val agg_table_renamed = agg_table.columns.foldLeft(agg_table) {
+        (tbl, cn) =>
+          cn match {
+            case sum_name_pattern(pure_name) =>
+              tbl.withColumnRenamed(cn, pure_name)
+            case _ => tbl
+          }
+      }
+
+      if (show_csv) {
+        agg_table_renamed.show() //Spark typically only shows the first twenty rows
+        print(agg_table_renamed.schema + "\n")
         /*filtered_table.write
           .options(Map("sep" -> "|||", "header" -> "True"))
           .mode("overwrite")
@@ -152,11 +187,12 @@ object AnalyzeDiff {
       }
 
       //return value of "map"
-      filtered_table
+      agg_table_renamed
     }
 
     //start to join the ${iteration} tables, null values are replaced with 0
-    val outer_joined_table = {
+    //this table is defined as a VAR because it will be clobbered when we add the array-type columns to it
+    var outer_joined_table = {
       val joined_table_with_nulls = table_list.reduce { (a, b) =>
         a.join(b, Seq("Function_(Full)"), "outer")
       }
@@ -165,65 +201,52 @@ object AnalyzeDiff {
       joined_table_with_nulls.na.fill(0, column_names)
     }
 
-    //aggregate the rows by function name
-    //this table is defined as a VAR because it will be clobbered when we add the array-type columns to it 
-    var groupped_table = outer_joined_table.groupBy("Function_(Full)").sum()
-
     //create a ArrayType column (which contains all CPU time) and add to the table
     //the purpose of doing this is to make per-row calculation easier (e.g. calculate the average CPU_Time of each row)
-    //Each column - let denote it 'x' - that we name in ${columns_of_interest} needs to be created an array that aggregates 
+    //Each column - let denote it 'x' - that we name in ${columns_of_interest} needs to be created an array that aggregates
     //col(x_1), col(x_2), ..., col(x_n) where n is equal to ${iteration}
 
-    /*val table_with_array = {
-      val cpu_time_column_names = (1 to iteration).map(x => s"sum(CPU_Time_$x)")
-      val seq_of_cpu_time_columns: Seq[Column] =
-        groupped_table.columns.foldLeft(Seq[Column]()) { (seq, cn) =>
-          cn match {
-            case x if cpu_time_column_names.contains(cn) =>
-              seq :+ groupped_table.apply(x)
-            case _ => seq
-          }
-        }
-      groupped_table.withColumn(
-        "CPU_Time_Array",
-        array(seq_of_cpu_time_columns: _*)
-      )
-    }*/
-
-    val table_with_array_2 = {
-      columns_of_interest.foreach{ 
+    val table_with_array = {
+      columns_of_interest.foreach {
         case coi if (coi.contains("Function") == false) => {
-          val per_iteration_column_names = (1 to iteration).map(idx => "sum(" + coi + s"_${idx})")
-          val seq_of_columns : Seq[Column] = 
-          groupped_table.columns.foldLeft(Seq[Column]()) { (seq, cn) =>
-            cn match {
-              case cn if per_iteration_column_names.contains(cn) =>
-                seq :+ groupped_table.apply(cn)
-              case _ => seq
+          //${per_iteration_column_names} will look like Seq("A_1", "A_2", "A_3", ...)
+          val per_iteration_column_names =
+            (1 to iteration).map(idx =>  coi + s"_${idx}")
+          val seq_of_columns: Seq[Column] =
+            outer_joined_table.columns.foldLeft(Seq[Column]()) { (seq, cn) =>
+              cn match {
+                case cn if per_iteration_column_names.contains(cn) =>
+                  seq :+ outer_joined_table.apply(cn)
+                case _ => seq
+              }
             }
-          }
-          groupped_table = groupped_table.withColumn(coi + "_Array", array(seq_of_columns:_*))
+          outer_joined_table = outer_joined_table.withColumn(
+            coi + "_Array",
+            array(seq_of_columns: _*)
+          )
         }
-        case _ => {}
+        case _ => { /*do nothing*/ }
       }
-      groupped_table
+      outer_joined_table
     }
 
-    table_with_array_2.createOrReplaceTempView("table_with_array")
-    //table_with_array_2.show()
-    //table_with_array_2.printSchema()
+    table_with_array.createOrReplaceTempView("table_with_array")
+    //table_with_array.show()
+    //table_with_array.printSchema()
 
-
+    //generate the query plan to calculate UDFs (skewness, and average)
     var sql_query_plan = Array[String]()
-    columns_of_interest.foreach{
-      case coi if(coi.contains("Function") == false) =>{
+    columns_of_interest.foreach {
+      case coi if (coi.contains("Function") == false) => {
         val array_name = coi + "_Array"
 
         sql_query_plan = sql_query_plan :+ ","
-        sql_query_plan = sql_query_plan :+ ("skewness(`" + array_name + "`) AS `Skewness_of_" + coi + "`" )
+        sql_query_plan =
+          sql_query_plan :+ ("skewness(`" + array_name + "`) AS `Skewness_of_" + coi + "`")
 
         sql_query_plan = sql_query_plan :+ ","
-        sql_query_plan = sql_query_plan :+ ("avrg(`" + array_name + "`) AS `Average_of_" + coi +"`")
+        sql_query_plan =
+          sql_query_plan :+ ("avrg(`" + array_name + "`) AS `Average_of_" + coi + "`")
       }
       case _ => {}
     }
@@ -231,16 +254,14 @@ object AnalyzeDiff {
     //remove the first comma from the query plan
     sql_query_plan = sql_query_plan.tail
 
-    //add the constant part to the query plan
+    //add the constant parts to the query plan
     sql_query_plan = "select *," +: sql_query_plan
     sql_query_plan = sql_query_plan :+ "from table_with_array"
-    
+
     val sql_query_plan_text = sql_query_plan.mkString(" ")
-    print(sql_query_plan_text+"\n")
 
     val calculated_table =
       spark.sql(
-        //"select *, skewness(CPU_Time_Array) AS Skewness_of_CPU_Time , avrg(CPU_Time_Array) AS Average_of_CPU_Time , skewness(CPU_Time:Effective_Time:Idle_Array) AS Skewness_of_CPU_Time:Effective_Time:Idle , avrg(CPU_Time:Effective_Time:Idle_Array) AS Average_of_CPU_Time:Effective_Time:Idle , skewness(CPU_Time:Effective_Time:Poor_Array) AS Skewness_of_CPU_Time:Effective_Time:Poor , avrg(CPU_Time:Effective_Time:Poor_Array) AS Average_of_CPU_Time:Effective_Time:Poor , skewness(CPU_Time:Effective_Time:Ok_Array) AS Skewness_of_CPU_Time:Effective_Time:Ok , avrg(CPU_Time:Effective_Time:Ok_Array) AS Average_of_CPU_Time:Effective_Time:Ok , skewness(CPU_Time:Effective_Time:Ideal_Array) AS Skewness_of_CPU_Time:Effective_Time:Ideal , avrg(CPU_Time:Effective_Time:Ideal_Array) AS Average_of_CPU_Time:Effective_Time:Ideal , skewness(CPU_Time:Effective_Time:Over_Array) AS Skewness_of_CPU_Time:Effective_Time:Over , avrg(CPU_Time:Effective_Time:Over_Array) AS Average_of_CPU_Time:Effective_Time:Over from table_with_array"
         //"select *, skewness(CPU_Time_Array) AS Skewness , avrg(CPU_Time_Array) AS Average from table_with_array"
         sql_query_plan_text
       )
@@ -257,25 +278,30 @@ object AnalyzeDiff {
 
     //create a reference ${final_table} to the table that we want to save
     //val final_table = rearranged_table.drop("CPU_Time_Array")
-    val final_table = rearranged_table.columns.foldLeft(rearranged_table){(tbl, column_name) => 
-      column_name match {
-        case cn if column_name.contains("Array") => tbl.drop(cn)
-        case _ => tbl
-      }
+    val final_table = calculated_table.columns.foldLeft(rearranged_table) {
+      (tbl, column_name) =>
+        column_name match {
+          case cn if column_name.contains("Array") => tbl.drop(cn)
+          case _                                   => tbl
+        }
     }
 
     //write the table to file
     //repartition the table down to one partition so that only one file is generated
     val result_file = new File(query_path, "result.csv")
 
-    final_table.printSchema()
-    //final_table.show
-    final_table
-      .repartition(1)
-      .write
-      .options(Map("sep" -> "|||", "header" -> "True"))
-      .mode("overwrite")
-      .csv(result_file.getPath())
+    if (save_result) {
+      final_table
+        .coalesce(1)
+        .write
+        .options(Map("sep" -> "|||", "header" -> "True"))
+        .mode("overwrite")
+        .csv(result_file.getPath())
+      print(s"${query_path.getName()} is written to file")
+    } else {
+      final_table.printSchema()
+      final_table.show()
+    }
   }
 
   val skewness = udf((x: Seq[Double]) => {
@@ -287,7 +313,6 @@ object AnalyzeDiff {
     val mn = new Mean()
     mn.evaluate(x.toArray, 0, x.length)
   })
-
 
 }
 
@@ -320,7 +345,17 @@ class Conf(arguments: Seq[String]) extends ScallopConf(arguments) {
         .contains(_))
   )
   val dryRun = opt[Boolean](
-    short = 'n'
+    short = 'n',
+    default = Option(false),
+    descr = "Does not write to any file if set to true"
+  )
+  val include_list = opt[List[String]](
+    name = "include_list",
+    noshort = true,
+    required = false,
+    default = Option(List[String]()), //default is empty array
+    descr =
+      "Which queries to analyze. Will process all queries found under reportLocation if this option is skipped"
   )
 
   verify()
