@@ -11,6 +11,7 @@ import org.rogach.scallop._ //CLI argument parsing
 import org.apache.commons.io._
 import java.io.{File, FileFilter}
 import java.lang.Exception
+import org.apache.arrow.flatbuf.Bool
 
 object AnalyzeDiff {
   def main(args: Array[String]) {
@@ -49,12 +50,17 @@ object AnalyzeDiff {
     queries_to_process.foreach(x => print(s"$x "))
     print("\n")
 
+    print(s"Demand wall time is ${conf.demand_wall_time()}\n")
+    print(s"drop_tiered_cpu_time is ${conf.drop_tiered_cpu_time()}\n")
+
     dir_content_list.foreach { query_path =>
       analyzeQueryResult(
         spark,
         query_path,
         queries_to_process,
-        !(conf.dryRun())
+        !(conf.dryRun()),
+        conf.demand_wall_time(),
+        conf.drop_tiered_cpu_time()
       )
     }
     return
@@ -64,7 +70,9 @@ object AnalyzeDiff {
       spark: SparkSession,
       query_path: File,
       queries_to_process: Array[String],
-      save_result: Boolean = true
+      save_result: Boolean = true,
+      demand_wall_time: Boolean = false,
+      drop_tiered_cpu_time: Boolean = false
   ) {
     if (!queries_to_process.contains(query_path.getName())) return
 
@@ -96,7 +104,7 @@ object AnalyzeDiff {
 
       val iteration: Int = stripped_name_list.max.toInt
 
-      createTable(spark, query_path, iteration, save_result)
+      createTable(spark, query_path, iteration, save_result, demand_wall_time, drop_tiered_cpu_time)
     }
   }
 
@@ -104,10 +112,12 @@ object AnalyzeDiff {
       spark: SparkSession,
       query_path: File,
       iteration: Int,
-      save_result: Boolean = true
+      save_result: Boolean = true,
+      demand_wall_time: Boolean = false,
+      drop_tiered_cpu_time: Boolean = false
   ) {
 
-    val show_csv = true
+    val show_csv = false
     val columns_of_interest: Seq[String] = Seq(
       "Function_(Full)", //this one is a must
       "CPU_Time",
@@ -124,8 +134,12 @@ object AnalyzeDiff {
         columns_of_interest.contains("CPU_Time:Effective_Time:Ideal") &&
         columns_of_interest.contains("CPU_Time:Effective_Time:Over")
 
+    if(demand_wall_time && !can_calculate_weighted_wall_time){
+      throw new Exception("CLI demanded wall time approximation be calculated; but input data does not contain all necessary data.")
+    }
+
     val columns_eligible_to_create_an_array_for =
-      if (can_calculate_weighted_wall_time)
+      if (can_calculate_weighted_wall_time && demand_wall_time)
         columns_of_interest :+ "Wall_Time_Approx"
       else columns_of_interest
 
@@ -199,7 +213,7 @@ object AnalyzeDiff {
       )
 
       val final_per_iteration_table = {
-        if (can_calculate_weighted_wall_time) {
+        if (can_calculate_weighted_wall_time && demand_wall_time) {
           val weighted_column =
             agg_table_renamed(s"CPU_Time:Effective_Time:Poor_${idx}") / weights(
               "Poor"
@@ -325,11 +339,12 @@ object AnalyzeDiff {
     }
 
     //create a reference ${final_table} to the table that we want to save
-    //val final_table = rearranged_table.drop("CPU_Time_Array")
     val final_table = calculated_table.columns.foldLeft(rearranged_table) {
       (tbl, column_name) =>
+        val pattern_for_tiered_cpu_time = """(Idle|Poor|Ok|Ideal|Over)""".r
         column_name match {
           case cn if column_name.contains("Array") => tbl.drop(cn)
+          case pattern_for_tiered_cpu_time.unanchored(x) if drop_tiered_cpu_time => tbl.drop(column_name) 
           case _                                   => tbl
         }
     }
@@ -396,7 +411,7 @@ class Conf(arguments: Seq[String]) extends ScallopConf(arguments) {
   val dryRun = opt[Boolean](
     short = 'n',
     default = Option(false),
-    descr = "Does not write to any file if set to true"
+    descr = "Default is false. Does not write to any file if set to true"
   )
   val include_list = opt[List[String]](
     name = "include_list",
@@ -405,6 +420,21 @@ class Conf(arguments: Seq[String]) extends ScallopConf(arguments) {
     default = Option(List[String]()), //default is empty array
     descr =
       "Which queries to analyze. Will process all queries found under reportLocation if this option is skipped"
+  )
+  val demand_wall_time = opt[Boolean](
+    name = "demand_wall_time",
+    noshort = true,
+    required = false,
+    default = Option(false),
+    descr = """Default is false. If set, the program will attempt to calculate the wall time from the four of the five tiers of CPU Time based on CPU utilization (Poor, Ok, Ideal, Over). 
+              |However, if these source metrics are not listed in the columns_of_interest, the program will fail and exit.""".stripMargin
+  )
+  val drop_tiered_cpu_time = opt[Boolean](
+    name = "drop_tiered_cpu_time",
+    noshort = true,
+    required = false,
+    default = Option(false),
+    descr = "Default is false. If set, will drop the five tiers of CPU time based on CPU utilization (Idle, Poor, Ok, Ideal, Over)."
   )
 
   verify()
