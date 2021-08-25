@@ -11,7 +11,6 @@ import org.rogach.scallop._ //CLI argument parsing
 import org.apache.commons.io._
 import java.io.{File, FileFilter}
 import java.lang.Exception
-import org.apache.arrow.flatbuf.Bool
 
 object AnalyzeDiff {
   def main(args: Array[String]) {
@@ -104,7 +103,14 @@ object AnalyzeDiff {
 
       val iteration: Int = stripped_name_list.max.toInt
 
-      createTable(spark, query_path, iteration, save_result, demand_wall_time, drop_tiered_cpu_time)
+      createTable(
+        spark,
+        query_path,
+        iteration,
+        save_result,
+        demand_wall_time,
+        drop_tiered_cpu_time
+      )
     }
   }
 
@@ -134,8 +140,10 @@ object AnalyzeDiff {
         columns_of_interest.contains("CPU_Time:Effective_Time:Ideal") &&
         columns_of_interest.contains("CPU_Time:Effective_Time:Over")
 
-    if(demand_wall_time && !can_calculate_weighted_wall_time){
-      throw new Exception("CLI demanded wall time approximation be calculated; but input data does not contain all necessary data.")
+    if (demand_wall_time && !can_calculate_weighted_wall_time) {
+      throw new Exception(
+        "CLI demanded wall time approximation be calculated; but input data does not contain all necessary data."
+      )
     }
 
     val columns_eligible_to_create_an_array_for =
@@ -178,13 +186,13 @@ object AnalyzeDiff {
 
       //only take record of function calls that exceed 0.05 CPU seconds
       //project the renamed table on only the columns we are interested in
-      val filter_criterion = s"CPU_Time_${idx}>0.05"
+      //val filter_criterion = s"CPU_Time_${idx}>0.05"
       val renamed_columns_of_interest =
         columns_of_interest.map(rename_column_function(idx))
       val dummy_column = renamed_table("Function").as("Dummy")
       val filtered_table = renamed_table
         .withColumn("Dummy", dummy_column)
-        .filter(filter_criterion)
+        //.filter(filter_criterion)
         .select("Dummy", renamed_columns_of_interest: _*)
         .drop("Dummy")
 
@@ -242,10 +250,6 @@ object AnalyzeDiff {
         final_per_iteration_table
           .show() //Spark typically only shows the first twenty rows
         print(final_per_iteration_table.schema + "\n")
-        /*filtered_table.write
-          .options(Map("sep" -> "|||", "header" -> "True"))
-          .mode("overwrite")
-          .csv(reportLocation + s"frame${idx}_renamed.csv")*/
       }
 
       //return value of "map"
@@ -339,21 +343,23 @@ object AnalyzeDiff {
     }
 
     //create a reference ${final_table} to the table that we want to save
-    val final_table = calculated_table.columns.foldLeft(rearranged_table) {
+    val final_table = rearranged_table.columns.foldLeft(rearranged_table) {
       (tbl, column_name) =>
         val pattern_for_tiered_cpu_time = """(Idle|Poor|Ok|Ideal|Over)""".r
         column_name match {
           case cn if column_name.contains("Array") => tbl.drop(cn)
-          case pattern_for_tiered_cpu_time.unanchored(x) if drop_tiered_cpu_time => tbl.drop(column_name) 
-          case _                                   => tbl
+          case pattern_for_tiered_cpu_time.unanchored(x)
+              if drop_tiered_cpu_time =>
+            tbl.drop(column_name)
+          case _ => tbl
         }
     }
 
     //write the table to file
     //repartition the table down to one partition so that only one file is generated
-    val result_file = new File(query_path, "result.csv")
 
     if (save_result) {
+      val result_file = new File(query_path, "result.csv")
       final_table
         .coalesce(1)
         .write
@@ -426,7 +432,8 @@ class Conf(arguments: Seq[String]) extends ScallopConf(arguments) {
     noshort = true,
     required = false,
     default = Option(false),
-    descr = """Default is false. If set, the program will attempt to calculate the wall time from the four of the five tiers of CPU Time based on CPU utilization (Poor, Ok, Ideal, Over). 
+    descr =
+      """Default is false. If set, the program will attempt to calculate the wall time from the four of the five tiers of CPU Time based on CPU utilization (Poor, Ok, Ideal, Over). 
               |However, if these source metrics are not listed in the columns_of_interest, the program will fail and exit.""".stripMargin
   )
   val drop_tiered_cpu_time = opt[Boolean](
@@ -434,7 +441,14 @@ class Conf(arguments: Seq[String]) extends ScallopConf(arguments) {
     noshort = true,
     required = false,
     default = Option(false),
-    descr = "Default is false. If set, will drop the five tiers of CPU time based on CPU utilization (Idle, Poor, Ok, Ideal, Over)."
+    descr =
+      "Default is false. If set, will drop the five tiers of CPU time based on CPU utilization (Idle, Poor, Ok, Ideal, Over)."
+  )
+  val sort = opt[Boolean](
+    name = "sort",
+    required = false,
+    default = Option(false),
+    descr = "Default is false. If set columns will be sorted."
   )
 
   verify()
