@@ -47,6 +47,8 @@ def main():
             cmd.extend(["-r", vtune_data_dir])
             cmd.extend(["-filter", "frame-domain="+query_name])
             cmd.extend(["-filter", "frame="+str(frame_id)])
+            cmd.extend(["-filter", "module=[Compiled Java code]"])
+            cmd.extend(["-filter", "module=[Dynamic code]"])
             cmd.extend(["-format", "csv"])
             cmd.extend(["-csv-delimiter", "|||"])
             
