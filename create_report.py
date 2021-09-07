@@ -8,7 +8,7 @@ import os
 def main():
     project_directory="/home/shen449/intel/vtune/projects/rapids_tpch_pc01/"
     matching_time_pattern="2021_8_19"
-    dry_run = False
+    dry_run = True
     default_target_dir = Path("./extracted_reports/" , matching_time_pattern )
     include_list = []
     exclude_list = []
@@ -23,6 +23,7 @@ def main():
 
     #create vtune reports for these directories
     for x in dir_list:
+        # x looks like this: "2021_9_5_22_44_TPCH_Q2_IT6_TEST1_1thrd_gc_noXcomp_fastdebugJVM"
         query_name = re.findall("(?<=_Q)\d+(?=\D)", x.name)        
         query_name = "q" + str(query_name[0])
         
@@ -31,15 +32,19 @@ def main():
         
         if(len(exclude_list) > 0 and (query_name in exclude_list)):
             continue
+
+        test_id = re.findall("(?<=_TEST)\d+(?=\D)", x.name)
+        test_id = int(test_id[0])
         
         iteration = re.findall("(?<=_IT)\d+(?=\D)", x.name)
         iteration = int(iteration[0])
     
-        per_query_result_dir = target_dir / Path(query_name)
+        per_query_result_dir = target_dir / Path(query_name) / Path("test" + str(test_id)) #e.g. "<target_dir>/q1/test2/"
         
         os.makedirs(per_query_result_dir.as_posix(), exist_ok=True)
         
         for frame_id in range(1, iteration+1):
+            #this for-loop will create the following csv files:  <target_dir>/q1/test2/it1.csv, <target_dir>/q1/test2/it2.csv, etc.
             vtune_data_dir = x.as_posix() 
             
             cmd = ["vtune"]
