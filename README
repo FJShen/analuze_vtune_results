@@ -1,0 +1,8 @@
+The general work flow. Modify the scripts and files accordingly that matches your needs. 
+
+1. ```python3 create_report.py``` extracts a csv report from each vtune result directory
+
+2. ```bash submit_job.sh``` launches Spark and runs the application defined in src/main/scala/diff_script.scala, generating a result csv file for each query.
+Note: use ```sbt package``` to compile the scala program into a jar file loadable by the Spark framework.
+
+3. ```bash rename_result_files.sh``` changes the hash-code style file name of those resulting csv files into "result.csv"  
