@@ -13,14 +13,14 @@ import java.io.{File, FileFilter}
 import java.lang.Exception
 
 object AnalyzeDiff {
+  lazy val sc = new SparkContext
+  lazy val spark = SparkSession.builder.appName("AnalyzeDifference").getOrCreate
+
   def main(args: Array[String]) {
     //parse CLI arguments
     val conf = new Conf(args)
 
-    val sc = new SparkContext
     sc.setLogLevel(conf.logLevel())
-
-    val spark = SparkSession.builder.appName("AnalyzeDifference").getOrCreate
 
     spark.udf.register("skewness", skewness)
     spark.udf.register("avrg", avrg)
@@ -52,9 +52,9 @@ object AnalyzeDiff {
     print(s"Demand wall time is ${conf.demand_wall_time()}\n")
     print(s"drop_tiered_cpu_time is ${conf.drop_tiered_cpu_time()}\n")
 
+    //do this for each query
     dir_content_list.foreach { query_path =>
       analyzeQueryResult(
-        spark,
         query_path,
         queries_to_process,
         !(conf.dryRun()),
@@ -66,13 +66,13 @@ object AnalyzeDiff {
   }
 
   def analyzeQueryResult(
-      spark: SparkSession,
       query_path: File,
       queries_to_process: Array[String],
       save_result: Boolean = true,
       demand_wall_time: Boolean = false,
       drop_tiered_cpu_time: Boolean = false
   ) {
+    //the report files' path will look like this: <report_location>/q1/test2/it1.csv
     if (!queries_to_process.contains(query_path.getName())) return
 
     print(s"Analyzing query report for ${query_path.getName()}\n")
@@ -104,7 +104,6 @@ object AnalyzeDiff {
       val iteration: Int = stripped_name_list.max.toInt
 
       createTable(
-        spark,
         query_path,
         iteration,
         save_result,
@@ -115,7 +114,6 @@ object AnalyzeDiff {
   }
 
   def createTable(
-      spark: SparkSession,
       query_path: File,
       iteration: Int,
       save_result: Boolean = true,
@@ -373,6 +371,26 @@ object AnalyzeDiff {
     }
   }
 
+  // get_dataframe(query_path)(test_id, it_id) will be passed to Array.tabulate(n1: Int, n2: Int)(f: (Int, Int) ⇒ T)
+  def get_dataframe(
+      query_path: File
+  )(test_id: Int, iteration_id: Int): DataFrame = {
+    val csv_file = new File(query_path, s"test${test_id}\/it${iteration_id}")
+
+    val raw_table = spark.read
+      .options(
+        Map(
+          "sep" -> "|||",
+          "header" -> "True",
+          "inferSchema" -> "True",
+          "enforceSchema" -> "False"
+        )
+      )
+      .csv(csv_file.getPath())
+
+    raw_table
+  }
+
   val skewness = udf((x: Seq[Double]) => {
     val sk = new Skewness()
     sk.evaluate(x.toArray, 0, x.length)
@@ -388,7 +406,7 @@ object AnalyzeDiff {
 class Conf(arguments: Seq[String]) extends ScallopConf(arguments) {
   val reportLocation = opt[String](
     short = 'r',
-    required = true,
+    required = false,
     //default = Option("/home/shen449/analyze_vtune_results/extracted_reports/"),
     descr =
       """Where the home directory for vTune csv-format report files is located. This direcotry is required to have a hierarchy looking like this: 
