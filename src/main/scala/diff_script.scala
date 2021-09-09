@@ -152,10 +152,36 @@ object AnalyzeDiff {
      */
 
     //todo: for each iteration, join all their tests and find the median value for each metric
-    val table_it1 = dataframe_matrix.tail.foldLeft(dataframe_matrix(0)(0)) {
+    /*val table_it1 = dataframe_matrix.tail.foldLeft(dataframe_matrix(0)(0)) {
       (df, ar_df) =>
         val joined_df = df.join(ar_df(0), Seq("Function_(Full)"), "inner")
         joined_df
+    }*/
+
+    val columns_eligible_to_create_an_array_for =
+      if (can_calculate_weighted_wall_time && demand_wall_time)
+        columns_of_interest :+ "Wall_Time_Approx"
+      else columns_of_interest
+
+    //for every iteration
+    val table_list: Seq[DataFrame] = (1 to iteration_count).toList.map{ idx_0 =>
+      val idx = idx_0 - 1  //0 to (iteration_count-1)
+
+      //join all tests 
+      val per_it_table = dataframe_matrix.tail.foldLeft(dataframe_matrix(0)(idx)) {
+      (df, ar_df) =>
+        val joined_df = df.join(ar_df(idx), Seq("Function_(Full)"), "inner")
+        joined_df
+      }
+
+      //generate a array for all columns of interest except "Function"
+      val table_with_array = generate_array_of_columns(per_it_table, columns_eligible_to_create_an_array_for)
+      table_with_array.createOrReplaceTempView(s"table_with_array_${idx_0}")
+
+      //generate a SQL query script
+
+
+
     }
 
     //val table_it1_cputime = table_it1.select("CPU_Time_1")
@@ -402,6 +428,42 @@ object AnalyzeDiff {
 
   }
 
+  def generate_sql_text(table: String, function_list: Seq[String], columns_arrays_to_use: Seq[String]): String = {
+    //generate the query plan to calculate UDFs (skewness, and average)
+    var sql_query_plan = Array[String]()
+    columns_arrays_to_use.foreach {
+      case coi if (false == coi.contains("Function")) => {
+        val array_name = coi + "_Array"
+
+        function_list.foreach{ f => 
+          sql_query_plan = sql_query_plan :+ ","
+          sql_query_plan =
+            sql_query_plan :+ (f + "(`" + array_name + "`) AS `"+ f + "_of_" + coi + "`")
+        }
+
+        /*sql_query_plan = sql_query_plan :+ ","
+        sql_query_plan =
+          sql_query_plan :+ ("skewness(`" + array_name + "`) AS `Skewness_of_" + coi + "`")
+
+        sql_query_plan = sql_query_plan :+ ","
+        sql_query_plan =
+          sql_query_plan :+ ("avrg(`" + array_name + "`) AS `Average_of_" + coi + "`")*/
+      }
+      case _ => {}
+    }
+    //the sql query plan should now look like this: ", xxx, yyy, zzz, www, ..., aaa, bbb"
+    //remove the first comma from the query plan
+    sql_query_plan = sql_query_plan.tail
+
+    //add the constant parts to the query plan
+    sql_query_plan = "select *," +: sql_query_plan
+    sql_query_plan = sql_query_plan :+ ("from " + table) 
+
+    val sql_query_plan_text = sql_query_plan.mkString(" ")
+
+    sql_query_plan_text
+  }
+
   // get_dataframe(query_path)(test_id, it_id) will be passed to Array.tabulate(n1: Int, n2: Int)(f: (Int, Int) ⇒ T)
   def get_dataframe(
       query_path: File,
@@ -466,7 +528,7 @@ object AnalyzeDiff {
       }
     }
 
-    val final_per_iteration_table = {
+    val final_table = {
       if (can_calculate_weighted_wall_time && demand_wall_time) {
         val weighted_column =
           agg_table_renamed(
@@ -496,7 +558,7 @@ object AnalyzeDiff {
       } else agg_table_renamed
     }
 
-    final_per_iteration_table
+    final_table
   }
 
   //the renaming function replaces all spaces with equal amount of underscores,
