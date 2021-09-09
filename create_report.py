@@ -7,8 +7,8 @@ import os
 
 def main():
     project_directory="/home/shen449/intel/vtune/projects/rapids_tpch_pc01/"
-    matching_time_pattern="2021_8_19"
-    dry_run = True
+    matching_time_pattern="2021_9_5"
+    dry_run = False
     default_target_dir = Path("./extracted_reports/" , matching_time_pattern )
     include_list = []
     exclude_list = []

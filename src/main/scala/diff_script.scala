@@ -101,40 +101,66 @@ object AnalyzeDiff {
 
     print(s"Analyzing query report for ${query_path.getName()}\n")
 
-    val dir_only_filter = new FileFilter() {
+    val file_only_filter = new FileFilter() {
       override def accept(file: File): Boolean = {
         //ignore all directories in this folder
         !(file.isDirectory())
       }
     }
 
-    val query_dir_content_list = query_path.listFiles(dir_only_filter)
-
-    if (query_dir_content_list.length == 0) {
-      print(s"${query_path.getPath()} is void of files. Skipping this.\n")
-    } else {
-      //extract the number of iteration and find the maximum value
-      val name_list = query_dir_content_list.map(_.getName())
-      val csv_name_pattern = """it(\d+)\.csv""".r
-      val stripped_name_list = name_list.map {
-        case csv_name_pattern(value) => {
-          value
-        }
-        case x: String => {
-          throw new Exception(s"${x}: file name's format is wrong")
-        }
-      }
-
-      val iteration: Int = stripped_name_list.max.toInt
-
-      createTable(
-        query_path,
-        iteration,
-        save_result,
-        demand_wall_time,
-        drop_tiered_cpu_time
-      )
+    //todo: find out how many tests
+    val test_name_pattern = """test(\d+)""".r
+    val test_dir_list = query_path.listFiles()
+    val test_dir_id_list = test_dir_list.map(_.getName()).map{
+      case test_name_pattern(value) => value.toInt
+      case _ => 0
     }
+    val test_count: Int = test_dir_id_list.max
+
+
+    //todo: find out how many iterations 
+    //we will only probe the first dir (i.e. "test1/")
+    val csv_name_pattern = """it(\d+)\.csv""".r
+    val query_dir_list = test_dir_list.find(x=>x.getName().contains("test1")).get.listFiles(file_only_filter) //only accept files, not dirs
+    val query_dir_id_list = query_dir_list.map(_.getName()).map{
+      case csv_name_pattern(value) => value.toInt
+      case _ => 0
+    }
+
+    val iteration_count: Int = query_dir_id_list.max
+
+    print(s"testcount is $test_count, iterationcount is $iteration_count\n")
+    test_dir_list.foreach(x => print(s"testdirlist: ${x.getName()}\n"))
+    query_dir_list.foreach(x => print(s"querydirlist: ${x.getName()}\n"))
+
+
+    val dataframe_matrix = Array.tabulate[DataFrame](test_count, iteration_count)(get_dataframe(query_path, demand_wall_time, drop_tiered_cpu_time))
+
+    /*
+    //this is test 3, iteration 3
+    dataframe_matrix(2)(2).printSchema()
+    dataframe_matrix(2)(2).show()
+    dataframe_matrix(2)(2).coalesce(1)
+        .write
+        .options(Map("sep" -> "|||", "header" -> "True"))
+        .mode("overwrite")
+        .csv(new File(query_path, "result.csv").getPath())
+    */
+
+    //todo: for each iteration, join all their tests and find the median value for each metric
+    val table_it1 = dataframe_matrix.tail.foldLeft(dataframe_matrix(0)(0)){ (df, ar_df) => 
+      val joined_df = df.join(ar_df(0), Seq("Function_(Full)"), "inner")
+      joined_df
+    }
+
+    //val table_it1_cputime = table_it1.select("CPU_Time_1")
+
+    val table_to_print = table_it1
+    table_to_print.printSchema()
+    table_to_print.show(numRows=3, truncate=0, vertical = true)
+
+
+    
   }
 
   def createTable(
@@ -265,7 +291,7 @@ object AnalyzeDiff {
     //Each column - let denote it 'x' - that we name in ${columns_of_interest} needs to be created an array that aggregates
     //col(x_1), col(x_2), ..., col(x_n) where n is equal to ${iteration}
 
-    val table_with_array = {
+    /*val table_with_array = {
       columns_eligible_to_create_an_array_for.foreach {
         case coi if (coi.contains("Function") == false) => {
           //${per_iteration_column_names} will look like Seq("A_1", "A_2", "A_3", ...)
@@ -287,7 +313,8 @@ object AnalyzeDiff {
         case _ => { /*do nothing*/ }
       }
       outer_joined_table
-    }
+    }*/
+    val table_with_array = generate_array_of_columns(outer_joined_table, columns_eligible_to_create_an_array_for)
 
     table_with_array.createOrReplaceTempView("table_with_array")
     //table_with_array.show()
@@ -366,24 +393,52 @@ object AnalyzeDiff {
     }
   }
 
+
+  //col_list is same as columns_eligible_to_create_an_array_for
+  def generate_array_of_columns(df: DataFrame, col_list: Seq[String]): DataFrame = {
+    var result_table = df
+    col_list.foreach {
+      //coi is "column of interest"
+      case coi if (coi.contains("Function") == false) => {
+        //${per_iteration_column_names} will look like Seq("A_1", "A_2", "A_3", ...)
+        //val per_iteration_column_names =
+          //(1 to iteration).map(idx => coi + s"_${idx}")
+        val seq_of_columns: Seq[Column] =
+          result_table.columns.foldLeft(Seq[Column]()) { (seq, cn) =>
+            cn match {
+              //case cn if per_iteration_column_names.contains(cn) =>
+              case cn if cn.contains(coi) =>
+                seq :+ result_table.apply(cn)
+              case _ => seq
+            }
+          }
+        result_table = result_table.withColumn(
+          coi + "_Array",
+          array(seq_of_columns: _*)
+        )
+      }
+      case _ => { /*do nothing*/ }
+    }
+    result_table
+
+  }
+
   // get_dataframe(query_path)(test_id, it_id) will be passed to Array.tabulate(n1: Int, n2: Int)(f: (Int, Int) ⇒ T)
   def get_dataframe(
       query_path: File,
       demand_wall_time: Boolean = false,
       drop_tiered_cpu_time: Boolean = false
-  )(test_id: Int, iteration_id: Int): DataFrame = {
+  )(test_id_0: Int, iteration_id_0: Int): DataFrame = {
+    val test_id = test_id_0 + 1
+    val iteration_id = iteration_id_0 + 1
+
     if (demand_wall_time && !can_calculate_weighted_wall_time) {
       throw new Exception(
         "CLI demanded wall time approximation be calculated; but input data does not contain all necessary data."
       )
     }
 
-    val columns_eligible_to_create_an_array_for =
-      if (can_calculate_weighted_wall_time && demand_wall_time)
-        columns_of_interest :+ "Wall_Time_Approx"
-      else columns_of_interest
-
-    val csv_file = new File(query_path, s"test${test_id}\/it${iteration_id}")
+    val csv_file = new File(query_path, s"test${test_id}/it${iteration_id}.csv")
 
     val raw_table = spark.read
       .options(
@@ -399,7 +454,7 @@ object AnalyzeDiff {
     val original_table = raw_table
     //rename the columns so that no space character exists; all columns' name except the first column are added the suffix "_x" where x is ${idx}
     val original_columns = original_table.columns
-    val renamed_columns = original_columns.map(rename_column_function(iteration_id))
+    val renamed_columns = original_columns.map(rename_column_function(test_id, iteration_id))
     val renamed_table =
       (original_columns zip renamed_columns).foldLeft(original_table) {
         (tbl, pair) =>
@@ -410,7 +465,7 @@ object AnalyzeDiff {
     //project the renamed table on only the columns we are interested in
     //val filter_criterion = s"CPU_Time_${idx}>0.05"
     val renamed_columns_of_interest =
-      columns_of_interest.map(rename_column_function(iteration_id))
+      columns_of_interest.map(rename_column_function(test_id, iteration_id))
     val dummy_column = renamed_table("Function").as("Dummy")
     val filtered_table = renamed_table
       .withColumn("Dummy", dummy_column)
@@ -435,24 +490,24 @@ object AnalyzeDiff {
     val final_per_iteration_table = {
       if (can_calculate_weighted_wall_time && demand_wall_time) {
         val weighted_column =
-          agg_table_renamed(s"CPU_Time:Effective_Time:Poor_${iteration_id}") / weights(
+          agg_table_renamed(s"CPU_Time:Effective_Time:Poor_${test_id}_${iteration_id}") / weights(
             "Poor"
           ) +
-            agg_table_renamed(s"CPU_Time:Effective_Time:Ok_${iteration_id}") / weights(
+            agg_table_renamed(s"CPU_Time:Effective_Time:Ok_${test_id}_${iteration_id}") / weights(
               "Ok"
             ) +
             agg_table_renamed(
-              s"CPU_Time:Effective_Time:Ideal_${iteration_id}"
+              s"CPU_Time:Effective_Time:Ideal_${test_id}_${iteration_id}"
             ) / weights(
               "Ideal"
             ) +
             agg_table_renamed(
-              s"CPU_Time:Effective_Time:Over_${iteration_id}"
+              s"CPU_Time:Effective_Time:Over_${test_id}_${iteration_id}"
             ) / weights(
               "Over"
             )
         agg_table_renamed.withColumn(
-          s"Wall_Time_Approx_${iteration_id}",
+          s"Wall_Time_Approx_${test_id}_${iteration_id}",
           weighted_column
         )
       } else agg_table_renamed
@@ -467,6 +522,13 @@ object AnalyzeDiff {
     str match {
       case x if str.contains("Function") => x.replace(" ", "_")
       case _                             => (str + s"_$idx").replace(" ", "_")
+    }
+  }
+
+  def rename_column_function(idx: Int, jdx: Int)(str: String) = {
+    str match {
+      case x if str.contains("Function") => x.replace(" ", "_")
+      case _                             => (str + s"_${idx}_${jdx}").replace(" ", "_")
     }
   }
 
@@ -522,7 +584,7 @@ class Conf(arguments: Seq[String]) extends ScallopConf(arguments) {
     required = false,
     default = Option(List[String]()), //default is empty array
     descr =
-      "Which queries to analyze. Will process all queries found under reportLocation if this option is skipped"
+      "Which queries to analyze. Will process all queries found under reportLocation if this option is skipped. E.g.: --include_list q1 q2 q6"
   )
   val demand_wall_time = opt[Boolean](
     name = "demand_wall_time",
