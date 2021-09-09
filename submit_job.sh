@@ -6,4 +6,4 @@ bash ${SPARK_HOME}/bin/spark-submit --class AnalyzeDiff --packages org.rogach:sc
 /home/shen449/analyze_vtune_results/target/scala-2.12/analyzediff_2.12-1.0.jar \
 -r /home/shen449/analyze_vtune_results/extracted_reports/2021_9_5 \
 --demand_wall_time --drop_tiered_cpu_time \
---include_list q1
+--sort
