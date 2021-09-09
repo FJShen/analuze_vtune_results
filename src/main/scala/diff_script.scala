@@ -16,6 +16,30 @@ object AnalyzeDiff {
   lazy val sc = new SparkContext
   lazy val spark = SparkSession.builder.appName("AnalyzeDifference").getOrCreate
 
+  val columns_of_interest: Seq[String] = Seq(
+    "Function_(Full)", //this one is a must
+    "CPU_Time",
+    "CPU_Time:Effective_Time:Idle",
+    "CPU_Time:Effective_Time:Poor",
+    "CPU_Time:Effective_Time:Ok",
+    "CPU_Time:Effective_Time:Ideal",
+    "CPU_Time:Effective_Time:Over"
+  )
+
+  lazy val can_calculate_weighted_wall_time =
+    columns_of_interest.contains("CPU_Time:Effective_Time:Poor") &&
+      columns_of_interest.contains("CPU_Time:Effective_Time:Ok") &&
+      columns_of_interest.contains("CPU_Time:Effective_Time:Ideal") &&
+      columns_of_interest.contains("CPU_Time:Effective_Time:Over")
+
+  val denominator = 40
+  val weights = Map[String, Double](
+    "Poor" -> 2,
+    "Ok" -> 6,
+    "Ideal" -> 10,
+    "Over" -> 20
+  )
+
   def main(args: Array[String]) {
     //parse CLI arguments
     val conf = new Conf(args)
@@ -122,21 +146,7 @@ object AnalyzeDiff {
   ) {
 
     val show_csv = false
-    val columns_of_interest: Seq[String] = Seq(
-      "Function_(Full)", //this one is a must
-      "CPU_Time",
-      "CPU_Time:Effective_Time:Idle",
-      "CPU_Time:Effective_Time:Poor",
-      "CPU_Time:Effective_Time:Ok",
-      "CPU_Time:Effective_Time:Ideal",
-      "CPU_Time:Effective_Time:Over"
-    )
 
-    val can_calculate_weighted_wall_time =
-      columns_of_interest.contains("CPU_Time:Effective_Time:Poor") &&
-        columns_of_interest.contains("CPU_Time:Effective_Time:Ok") &&
-        columns_of_interest.contains("CPU_Time:Effective_Time:Ideal") &&
-        columns_of_interest.contains("CPU_Time:Effective_Time:Over")
 
     if (demand_wall_time && !can_calculate_weighted_wall_time) {
       throw new Exception(
@@ -149,14 +159,6 @@ object AnalyzeDiff {
         columns_of_interest :+ "Wall_Time_Approx"
       else columns_of_interest
 
-    //the renaming function replaces all spaces with equal amount of underscores,
-    //and adds a numerical suffix to the string if the string does not contain substring "Function"
-    def rename_column_function(idx: Int)(str: String) = {
-      str match {
-        case x if str.contains("Function") => x.replace(" ", "_")
-        case _                             => (str + s"_$idx").replace(" ", "_")
-      }
-    }
 
     val table_list: Seq[DataFrame] = (1 to iteration).toList.map { idx =>
       //read the raw output file from vtune report
@@ -208,16 +210,9 @@ object AnalyzeDiff {
           }
       }
 
+
       //calculate a weighted average of the CPU effective time and call it the "wall time"
       //this is a wild approximation
-      val denominator = 40
-      val weights = Map[String, Double](
-        "Poor" -> 2,
-        "Ok" -> 6,
-        "Ideal" -> 10,
-        "Over" -> 20
-      )
-
       val final_per_iteration_table = {
         if (can_calculate_weighted_wall_time && demand_wall_time) {
           val weighted_column =
@@ -373,8 +368,21 @@ object AnalyzeDiff {
 
   // get_dataframe(query_path)(test_id, it_id) will be passed to Array.tabulate(n1: Int, n2: Int)(f: (Int, Int) ⇒ T)
   def get_dataframe(
-      query_path: File
+      query_path: File,
+      demand_wall_time: Boolean = false,
+      drop_tiered_cpu_time: Boolean = false
   )(test_id: Int, iteration_id: Int): DataFrame = {
+    if (demand_wall_time && !can_calculate_weighted_wall_time) {
+      throw new Exception(
+        "CLI demanded wall time approximation be calculated; but input data does not contain all necessary data."
+      )
+    }
+
+    val columns_eligible_to_create_an_array_for =
+      if (can_calculate_weighted_wall_time && demand_wall_time)
+        columns_of_interest :+ "Wall_Time_Approx"
+      else columns_of_interest
+
     val csv_file = new File(query_path, s"test${test_id}\/it${iteration_id}")
 
     val raw_table = spark.read
@@ -388,7 +396,78 @@ object AnalyzeDiff {
       )
       .csv(csv_file.getPath())
 
-    raw_table
+    val original_table = raw_table
+    //rename the columns so that no space character exists; all columns' name except the first column are added the suffix "_x" where x is ${idx}
+    val original_columns = original_table.columns
+    val renamed_columns = original_columns.map(rename_column_function(iteration_id))
+    val renamed_table =
+      (original_columns zip renamed_columns).foldLeft(original_table) {
+        (tbl, pair) =>
+          tbl.withColumnRenamed(pair._1, pair._2)
+      }
+
+    //only take record of function calls that exceed 0.05 CPU seconds
+    //project the renamed table on only the columns we are interested in
+    //val filter_criterion = s"CPU_Time_${idx}>0.05"
+    val renamed_columns_of_interest =
+      columns_of_interest.map(rename_column_function(iteration_id))
+    val dummy_column = renamed_table("Function").as("Dummy")
+    val filtered_table = renamed_table
+      .withColumn("Dummy", dummy_column)
+      //.filter(filter_criterion)
+      .select("Dummy", renamed_columns_of_interest: _*)
+      .drop("Dummy")
+
+    //aggregate the table
+    val agg_table = filtered_table.groupBy("Function_(Full)").sum()
+
+    //rename the columns where a "sum" has been put before the metric name
+    val sum_name_pattern = """sum\((.*)\)""".r
+    val agg_table_renamed = agg_table.columns.foldLeft(agg_table) {
+      (tbl, cn) =>
+        cn match {
+          case sum_name_pattern(pure_name) =>
+            tbl.withColumnRenamed(cn, pure_name)
+          case _ => tbl
+        }
+    }    
+
+    val final_per_iteration_table = {
+      if (can_calculate_weighted_wall_time && demand_wall_time) {
+        val weighted_column =
+          agg_table_renamed(s"CPU_Time:Effective_Time:Poor_${iteration_id}") / weights(
+            "Poor"
+          ) +
+            agg_table_renamed(s"CPU_Time:Effective_Time:Ok_${iteration_id}") / weights(
+              "Ok"
+            ) +
+            agg_table_renamed(
+              s"CPU_Time:Effective_Time:Ideal_${iteration_id}"
+            ) / weights(
+              "Ideal"
+            ) +
+            agg_table_renamed(
+              s"CPU_Time:Effective_Time:Over_${iteration_id}"
+            ) / weights(
+              "Over"
+            )
+        agg_table_renamed.withColumn(
+          s"Wall_Time_Approx_${iteration_id}",
+          weighted_column
+        )
+      } else agg_table_renamed
+    }
+
+    final_per_iteration_table
+  }
+
+  //the renaming function replaces all spaces with equal amount of underscores,
+  //and adds a numerical suffix to the string if the string does not contain substring "Function"
+  def rename_column_function(idx: Int)(str: String) = {
+    str match {
+      case x if str.contains("Function") => x.replace(" ", "_")
+      case _                             => (str + s"_$idx").replace(" ", "_")
+    }
   }
 
   val skewness = udf((x: Seq[Double]) => {
