@@ -393,21 +393,20 @@ object AnalyzeDiff {
     }
   }
 
-
-  //col_list is same as columns_eligible_to_create_an_array_for
-  def generate_array_of_columns(df: DataFrame, col_list: Seq[String]): DataFrame = {
+  def generate_array_of_columns(
+      df: DataFrame,
+      col_list: Seq[String]
+  ): DataFrame = {
     var result_table = df
     col_list.foreach {
       //coi is "column of interest"
       case coi if (coi.contains("Function") == false) => {
-        //${per_iteration_column_names} will look like Seq("A_1", "A_2", "A_3", ...)
-        //val per_iteration_column_names =
-          //(1 to iteration).map(idx => coi + s"_${idx}")
+        //the coi's string might have some trailing numbers in the form of "(_\d+)*".E.g. "xxxxx_2_6_42". We need to pick columns that have the same substring before the "(_\d+)*" part.
+        val coi_regex = (coi + """(_\d*)*""").r
         val seq_of_columns: Seq[Column] =
           result_table.columns.foldLeft(Seq[Column]()) { (seq, cn) =>
             cn match {
-              //case cn if per_iteration_column_names.contains(cn) =>
-              case cn if cn.contains(coi) =>
+              case coi_regex(_) =>
                 seq :+ result_table.apply(cn)
               case _ => seq
             }
@@ -422,6 +421,8 @@ object AnalyzeDiff {
     result_table
 
   }
+
+
 
   // get_dataframe(query_path)(test_id, it_id) will be passed to Array.tabulate(n1: Int, n2: Int)(f: (Int, Int) ⇒ T)
   def get_dataframe(
