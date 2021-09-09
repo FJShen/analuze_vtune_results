@@ -147,7 +147,6 @@ object AnalyzeDiff {
 
     val show_csv = false
 
-
     if (demand_wall_time && !can_calculate_weighted_wall_time) {
       throw new Exception(
         "CLI demanded wall time approximation be calculated; but input data does not contain all necessary data."
@@ -158,7 +157,6 @@ object AnalyzeDiff {
       if (can_calculate_weighted_wall_time && demand_wall_time)
         columns_of_interest :+ "Wall_Time_Approx"
       else columns_of_interest
-
 
     val table_list: Seq[DataFrame] = (1 to iteration).toList.map { idx =>
       //read the raw output file from vtune report
@@ -209,7 +207,6 @@ object AnalyzeDiff {
             case _ => tbl
           }
       }
-
 
       //calculate a weighted average of the CPU effective time and call it the "wall time"
       //this is a wild approximation
@@ -265,7 +262,7 @@ object AnalyzeDiff {
     //Each column - let denote it 'x' - that we name in ${columns_of_interest} needs to be created an array that aggregates
     //col(x_1), col(x_2), ..., col(x_n) where n is equal to ${iteration}
 
-    val table_with_array = {
+    /*val table_with_array = {
       columns_eligible_to_create_an_array_for.foreach {
         case coi if (coi.contains("Function") == false) => {
           //${per_iteration_column_names} will look like Seq("A_1", "A_2", "A_3", ...)
@@ -287,11 +284,15 @@ object AnalyzeDiff {
         case _ => { /*do nothing*/ }
       }
       outer_joined_table
-    }
+    }*/
+    val table_with_array = generate_array_of_columns(
+      outer_joined_table,
+      columns_eligible_to_create_an_array_for
+    )
 
     table_with_array.createOrReplaceTempView("table_with_array")
-    //table_with_array.show()
-    //table_with_array.printSchema()
+    table_with_array.printSchema()
+    table_with_array.show(numRows = 2, truncate = 0, vertical = true)
 
     //generate the query plan to calculate UDFs (skewness, and average)
     var sql_query_plan = Array[String]()
@@ -399,7 +400,8 @@ object AnalyzeDiff {
     val original_table = raw_table
     //rename the columns so that no space character exists; all columns' name except the first column are added the suffix "_x" where x is ${idx}
     val original_columns = original_table.columns
-    val renamed_columns = original_columns.map(rename_column_function(iteration_id))
+    val renamed_columns =
+      original_columns.map(rename_column_function(iteration_id))
     val renamed_table =
       (original_columns zip renamed_columns).foldLeft(original_table) {
         (tbl, pair) =>
@@ -423,22 +425,25 @@ object AnalyzeDiff {
 
     //rename the columns where a "sum" has been put before the metric name
     val sum_name_pattern = """sum\((.*)\)""".r
-    val agg_table_renamed = agg_table.columns.foldLeft(agg_table) {
-      (tbl, cn) =>
-        cn match {
-          case sum_name_pattern(pure_name) =>
-            tbl.withColumnRenamed(cn, pure_name)
-          case _ => tbl
-        }
-    }    
+    val agg_table_renamed = agg_table.columns.foldLeft(agg_table) { (tbl, cn) =>
+      cn match {
+        case sum_name_pattern(pure_name) =>
+          tbl.withColumnRenamed(cn, pure_name)
+        case _ => tbl
+      }
+    }
 
     val final_per_iteration_table = {
       if (can_calculate_weighted_wall_time && demand_wall_time) {
         val weighted_column =
-          agg_table_renamed(s"CPU_Time:Effective_Time:Poor_${iteration_id}") / weights(
+          agg_table_renamed(
+            s"CPU_Time:Effective_Time:Poor_${iteration_id}"
+          ) / weights(
             "Poor"
           ) +
-            agg_table_renamed(s"CPU_Time:Effective_Time:Ok_${iteration_id}") / weights(
+            agg_table_renamed(
+              s"CPU_Time:Effective_Time:Ok_${iteration_id}"
+            ) / weights(
               "Ok"
             ) +
             agg_table_renamed(
@@ -479,6 +484,36 @@ object AnalyzeDiff {
     val mn = new Mean()
     mn.evaluate(x.toArray, 0, x.length)
   })
+
+  //col_list is same as columns_eligible_to_create_an_array_for
+  def generate_array_of_columns(
+      df: DataFrame,
+      col_list: Seq[String]
+  ): DataFrame = {
+    var result_table = df
+    col_list.foreach {
+      //coi is "column of interest"
+      case coi if (coi.contains("Function") == false) => {
+        //the coi's string might have some trailing numbers in the form of "(_\d+)*".E.g. "xxxxx_2_6_42". We need to pick columns that have the same substring before the "(_\d+)*" part.
+        val coi_regex = (coi + """(_\d*)*""").r
+        val seq_of_columns: Seq[Column] =
+          result_table.columns.foldLeft(Seq[Column]()) { (seq, cn) =>
+            cn match {
+              case coi_regex(_) =>
+                seq :+ result_table.apply(cn)
+              case _ => seq
+            }
+          }
+        result_table = result_table.withColumn(
+          coi + "_Array",
+          array(seq_of_columns: _*)
+        )
+      }
+      case _ => { /*do nothing*/ }
+    }
+    result_table
+
+  }
 
 }
 
