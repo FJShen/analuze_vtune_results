@@ -5,12 +5,14 @@ import org.apache.spark.SparkContext
 import org.apache.spark.sql.expressions.UserDefinedFunction
 
 import org.apache.commons.math3.stat.descriptive.moment._ //Skewness, Mean
+import org.apache.commons.math3.stat.descriptive.rank._ //Median
 
 import org.rogach.scallop._ //CLI argument parsing
 
 import org.apache.commons.io._
 import java.io.{File, FileFilter}
 import java.lang.Exception
+import javax.xml.crypto.Data
 
 object AnalyzeDiff {
   lazy val sc = new SparkContext
@@ -46,8 +48,9 @@ object AnalyzeDiff {
 
     sc.setLogLevel(conf.logLevel())
 
-    spark.udf.register("skewness", skewness)
-    spark.udf.register("avrg", avrg)
+    spark.udf.register("Skewness", skewness)
+    spark.udf.register("Average", avrg)
+    spark.udf.register("Median", median)
 
     //scan the directory to obtain a list of queries to process
     val reportLocation = conf.reportLocation()
@@ -83,7 +86,8 @@ object AnalyzeDiff {
         queries_to_process,
         !(conf.dryRun()),
         conf.demand_wall_time(),
-        conf.drop_tiered_cpu_time()
+        conf.drop_tiered_cpu_time(),
+        conf.sort()
       )
     }
     return
@@ -94,7 +98,8 @@ object AnalyzeDiff {
       queries_to_process: Array[String],
       save_result: Boolean = true,
       demand_wall_time: Boolean = false,
-      drop_tiered_cpu_time: Boolean = false
+      drop_tiered_cpu_time: Boolean = false,
+      sort: Boolean = false
   ) {
     //the report files' path will look like this: <report_location>/q1/test2/it1.csv
     if (!queries_to_process.contains(query_path.getName())) return
@@ -131,9 +136,9 @@ object AnalyzeDiff {
 
     val iteration_count: Int = query_dir_id_list.max
 
-    print(s"testcount is $test_count, iterationcount is $iteration_count\n")
-    test_dir_list.foreach(x => print(s"testdirlist: ${x.getName()}\n"))
-    query_dir_list.foreach(x => print(s"querydirlist: ${x.getName()}\n"))
+    //print(s"testcount is $test_count, iterationcount is $iteration_count\n")
+    //test_dir_list.foreach(x => print(s"testdirlist: ${x.getName()}\n"))
+    //query_dir_list.foreach(x => print(s"querydirlist: ${x.getName()}\n"))
 
     val dataframe_matrix =
       Array.tabulate[DataFrame](test_count, iteration_count)(
@@ -151,44 +156,114 @@ object AnalyzeDiff {
         .csv(new File(query_path, "result.csv").getPath())
      */
 
-    //todo: for each iteration, join all their tests and find the median value for each metric
-    /*val table_it1 = dataframe_matrix.tail.foldLeft(dataframe_matrix(0)(0)) {
-      (df, ar_df) =>
-        val joined_df = df.join(ar_df(0), Seq("Function_(Full)"), "inner")
-        joined_df
-    }*/
-
     val columns_eligible_to_create_an_array_for =
       if (can_calculate_weighted_wall_time && demand_wall_time)
         columns_of_interest :+ "Wall_Time_Approx"
       else columns_of_interest
 
     //for every iteration
-    val table_list: Seq[DataFrame] = (1 to iteration_count).toList.map{ idx_0 =>
-      val idx = idx_0 - 1  //0 to (iteration_count-1)
+    val table_list: Seq[DataFrame] = (1 to iteration_count).toList.map {
+      idx_0 =>
+        val idx = idx_0 - 1 //0 to (iteration_count-1)
 
-      //join all tests 
-      val per_it_table = dataframe_matrix.tail.foldLeft(dataframe_matrix(0)(idx)) {
-      (df, ar_df) =>
-        val joined_df = df.join(ar_df(idx), Seq("Function_(Full)"), "inner")
-        joined_df
-      }
+        //join all tests
+        val per_it_table =
+          dataframe_matrix.tail.foldLeft(dataframe_matrix(0)(idx)) {
+            (df, ar_df) =>
+              val joined_df =
+                df.join(ar_df(idx), Seq("Function_(Full)"), "outer")
+              joined_df
+          }
 
-      //generate a array for all columns of interest except "Function"
-      val table_with_array = generate_array_of_columns(per_it_table, columns_eligible_to_create_an_array_for)
-      table_with_array.createOrReplaceTempView(s"table_with_array_${idx_0}")
+        val column_names = per_it_table.columns
 
-      //generate a SQL query script
+        val table_without_na = per_it_table.na.fill(0, column_names)
 
+        //generate a array for all columns of interest except "Function"
+        val table_with_array = generate_array_of_columns(
+          table_without_na,
+          columns_eligible_to_create_an_array_for
+        )
+        val temp_view_name = s"table_with_array_${idx_0}"
+        table_with_array.createOrReplaceTempView(temp_view_name)
 
+        //generate a SQL query script and execute it
+        val sql_query_plan_text = generate_sql_text(
+          temp_view_name,
+          Seq("Median"),
+          columns_eligible_to_create_an_array_for
+        )
+        val median_table = spark.sql(sql_query_plan_text)
 
+        //drop all arrays and other stuff, retain only the main key ("Function") and median values
+        val columns_to_remain = median_table.columns.filter { x =>
+          (x.contains("Function") || x.contains("Median"))
+        }
+        val cleaned_table = median_table.select(
+          columns_to_remain.head,
+          columns_to_remain.tail: _*
+        )
+
+        val median_capture_regex = """Median_of_(.*)""".r
+        val clean_renamed_table =
+          cleaned_table.columns.foldLeft(cleaned_table) { (df, cn) =>
+            cn match {
+              case median_capture_regex(real_name) =>
+                df.withColumnRenamed(cn, s"${real_name}_${idx_0}")
+              case _ => df
+            }
+          }
+
+        //clean_renamed_table.printSchema()
+        //clean_renamed_table.show(numRows = 3, truncate = 0, vertical = true)
+
+        clean_renamed_table
     }
+
+    val summarized_table = find_stat_of_df_list(
+      table_list,
+      columns_eligible_to_create_an_array_for,
+      drop_tiered_cpu_time
+    )
+
+    val final_table = if(sort){
+      //rearrange the columns for a better view
+        val rearranged_column_names = summarized_table.columns.sorted
+        val rearranged_columns =
+          rearranged_column_names.map(summarized_table(_))
+
+        summarized_table.select(rearranged_columns: _*)
+        //The function signature of [[select]] is (Columns* => Dataframe).
+        //What does * in the function signature mean? What does :_* in the function invocation mean? Check this out: https://scala-lang.org/files/archive/spec/2.13/04-basic-declarations-and-definitions.html#repeated-parameters
+    }
+    else{
+      summarized_table
+    }
+
+
+    //write the table to file
+    //repartition the table down to one partition so that only one file is generated
+
+    if (save_result) {
+      val result_file = new File(query_path, "result.csv")
+      final_table
+        .coalesce(1)
+        .write
+        .options(Map("sep" -> "|||", "header" -> "True"))
+        .mode("overwrite")
+        .csv(result_file.getPath())
+      print(s"${query_path.getName()} is written to file\n")
+    } else {
+      final_table.printSchema()
+      final_table.show(numRows = 3, truncate = 0, vertical = true)
+    }
+
 
     //val table_it1_cputime = table_it1.select("CPU_Time_1")
 
-    val table_to_print = table_it1
-    table_to_print.printSchema()
-    table_to_print.show(numRows = 3, truncate = 0, vertical = true)
+    //val table_to_print = table_it1
+    //table_to_print.printSchema()
+    //table_to_print.show(numRows = 3, truncate = 0, vertical = true)
 
   }
 
@@ -327,30 +402,11 @@ object AnalyzeDiff {
     //table_with_array.printSchema()
 
     //generate the query plan to calculate UDFs (skewness, and average)
-    var sql_query_plan = Array[String]()
-    columns_eligible_to_create_an_array_for.foreach {
-      case coi if (coi.contains("Function") == false) => {
-        val array_name = coi + "_Array"
-
-        sql_query_plan = sql_query_plan :+ ","
-        sql_query_plan =
-          sql_query_plan :+ ("skewness(`" + array_name + "`) AS `Skewness_of_" + coi + "`")
-
-        sql_query_plan = sql_query_plan :+ ","
-        sql_query_plan =
-          sql_query_plan :+ ("avrg(`" + array_name + "`) AS `Average_of_" + coi + "`")
-      }
-      case _ => {}
-    }
-    //the sql query plan should now look like this: ", xxx, yyy, zzz, www, ..., aaa, bbb"
-    //remove the first comma from the query plan
-    sql_query_plan = sql_query_plan.tail
-
-    //add the constant parts to the query plan
-    sql_query_plan = "select *," +: sql_query_plan
-    sql_query_plan = sql_query_plan :+ "from table_with_array"
-
-    val sql_query_plan_text = sql_query_plan.mkString(" ")
+    val sql_query_plan_text = generate_sql_text(
+      "table_with_array",
+      Seq("Skewness", "Average"),
+      columns_eligible_to_create_an_array_for
+    )
 
     val calculated_table =
       spark.sql(
@@ -428,17 +484,21 @@ object AnalyzeDiff {
 
   }
 
-  def generate_sql_text(table: String, function_list: Seq[String], columns_arrays_to_use: Seq[String]): String = {
+  def generate_sql_text(
+      table: String,
+      function_list: Seq[String],
+      columns_arrays_to_use: Seq[String]
+  ): String = {
     //generate the query plan to calculate UDFs (skewness, and average)
     var sql_query_plan = Array[String]()
     columns_arrays_to_use.foreach {
       case coi if (false == coi.contains("Function")) => {
         val array_name = coi + "_Array"
 
-        function_list.foreach{ f => 
+        function_list.foreach { f =>
           sql_query_plan = sql_query_plan :+ ","
           sql_query_plan =
-            sql_query_plan :+ (f + "(`" + array_name + "`) AS `"+ f + "_of_" + coi + "`")
+            sql_query_plan :+ (f + "(`" + array_name + "`) AS `" + f + "_of_" + coi + "`")
         }
 
         /*sql_query_plan = sql_query_plan :+ ","
@@ -457,7 +517,7 @@ object AnalyzeDiff {
 
     //add the constant parts to the query plan
     sql_query_plan = "select *," +: sql_query_plan
-    sql_query_plan = sql_query_plan :+ ("from " + table) 
+    sql_query_plan = sql_query_plan :+ ("from " + table)
 
     val sql_query_plan_text = sql_query_plan.mkString(" ")
 
@@ -561,6 +621,71 @@ object AnalyzeDiff {
     final_table
   }
 
+  def find_stat_of_df_list(
+      table_list: Seq[DataFrame],
+      columns_eligible_to_create_an_array_for: Seq[String],
+      drop_tiered_cpu_time: Boolean = false
+  ): DataFrame = {
+
+    var outer_joined_table = {
+      val joined_table_with_nulls = table_list.reduce { (a, b) =>
+        a.join(b, Seq("Function_(Full)"), "outer")
+      }
+      val column_names = joined_table_with_nulls.columns
+
+      joined_table_with_nulls.na.fill(0, column_names)
+    }
+
+    //create a ArrayType column (which contains all CPU time) and add to the table
+    //the purpose of doing this is to make per-row calculation easier (e.g. calculate the average CPU_Time of each row)
+    //Each column - let denote it 'x' - that we name in ${columns_of_interest} needs to be created an array that aggregates
+    //col(x_1), col(x_2), ..., col(x_n) where n is equal to ${iteration}
+
+    val table_with_array = generate_array_of_columns(
+      outer_joined_table,
+      columns_eligible_to_create_an_array_for
+    )
+
+    table_with_array.createOrReplaceTempView("table_with_array")
+    //table_with_array.show()
+    //table_with_array.printSchema()
+
+    //generate the query plan to calculate UDFs (skewness, and average)
+    val sql_query_plan_text = generate_sql_text(
+      "table_with_array",
+      Seq("Skewness", "Average"),
+      columns_eligible_to_create_an_array_for
+    )
+
+    val calculated_table =
+      spark.sql(
+        sql_query_plan_text
+      )
+
+
+    //create a reference ${final_table} to the table that we want to save
+    //drop all arrays as we cannot save those
+    //drop all tiered cpu time if specified in CLI command
+
+    val final_table = {
+      val pattern_for_tiered_cpu_time = """(Idle|Poor|Ok|Ideal|Over)""".r
+      
+      val table_with_columns_dropped = calculated_table.columns.foldLeft(calculated_table) {
+        (tbl, column_name) =>
+          column_name match {
+            case cn if column_name.contains("Array") => tbl.drop(cn)
+            case pattern_for_tiered_cpu_time.unanchored(x)
+                if drop_tiered_cpu_time =>
+              tbl.drop(column_name)
+            case _ => tbl
+          }
+      }
+      table_with_columns_dropped 
+    }
+
+    final_table
+  }
+
   //the renaming function replaces all spaces with equal amount of underscores,
   //and adds a numerical suffix to the string if the string does not contain substring "Function"
   def rename_column_function(idx: Int)(str: String) = {
@@ -584,6 +709,11 @@ object AnalyzeDiff {
 
   val avrg = udf((x: Seq[Double]) => {
     val mn = new Mean()
+    mn.evaluate(x.toArray, 0, x.length)
+  })
+
+  val median = udf((x: Seq[Double]) => {
+    val mn = new Median()
     mn.evaluate(x.toArray, 0, x.length)
   })
 
